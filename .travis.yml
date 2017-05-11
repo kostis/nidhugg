@@ -32,10 +32,11 @@ before_script:
   - export CPATH=/usr/lib/gcc/x86_64-linux-gnu/4.9/include
   - export CC=gcc-4.9
   - export CXX=g++-4.9
+  #- export CXXFLAGS=-Wno-unknown-warning-option
   - autoreconf --install
   - ./configure #|| cat config.log
   - make -j6
-script: "make test && make valgrind"
+script: "make test && make valtest"
 cache:
   directories:
     - cache
