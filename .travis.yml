@@ -5,7 +5,7 @@ branches:
     - master
 env:
   - LLVM_VERSION=3.5.0
-  - LLVM_VERSION=3.8.1
+  #- LLVM_VERSION=3.8.1
 addons:
   apt:
     sources:
@@ -19,7 +19,6 @@ addons:
       - autoconf
       - automake
       - python3
-      - llvm-dev
       - libffi-dev
       - libboost-test1.55-dev
       - valgrind
@@ -33,7 +32,7 @@ before_script:
   - export CC=gcc-4.9
   - export CXX=g++-4.9
   - autoreconf --install
-  - ./configure || cat config.log
+  - ./configure #|| cat config.log
   - make -j6
 script: "make test && make valgrind"
 cache:
