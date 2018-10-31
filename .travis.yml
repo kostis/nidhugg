@@ -17,6 +17,7 @@ addons:
       - autoconf
       - automake
       - python3
+      - llvm-dev
       - libffi-dev
       - libboost-test1.55-dev
       - valgrind
