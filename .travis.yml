@@ -3,7 +3,7 @@ sudo: false
 env:
   - LLVM_VERSION=3.5.0  # default on Debian jessie
   - LLVM_VERSION=3.6.2
-  #- LLVM_VERSION=3.8.1  # default on Debian stretch - does NOT work yet
+  - LLVM_VERSION=3.8.1  # default on Debian stretch - does NOT work yet
 addons:
   apt:
     sources:
@@ -20,7 +20,7 @@ addons:
       - libffi-dev
       - libboost-test1.55-dev
       - valgrind
-      - libedit-dev     # required by LLVM 3.5.0
+      - libedit-dev     # required by LLVM < 6.0
 before_script:
   - ./travis/install_deps.sh
   - export LLVM_DIR=$PWD/cache/clang+llvm-$LLVM_VERSION
