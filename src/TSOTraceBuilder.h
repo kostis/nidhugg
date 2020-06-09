@@ -33,43 +33,43 @@ class TSOTraceBuilder : public TSOPSOTraceBuilder{
 public:
   TSOTraceBuilder(const Configuration &conf = Configuration::default_conf);
   virtual ~TSOTraceBuilder();
-  virtual bool schedule(int *proc, int *aux, int *alt, bool *dryrun);
-  virtual void refuse_schedule();
-  virtual void mark_available(int proc, int aux = -1);
-  virtual void mark_unavailable(int proc, int aux = -1);
-  virtual void cancel_replay();
-  virtual bool is_replaying() const;
-  virtual void metadata(const llvm::MDNode *md);
-  virtual bool sleepset_is_empty() const;
-  virtual bool check_for_cycles();
-  virtual Trace *get_trace() const;
-  virtual bool reset();
-  virtual IID<CPid> get_iid() const;
+  virtual bool schedule(int *proc, int *aux, int *alt, bool *dryrun) override;
+  virtual void refuse_schedule() override;
+  virtual void mark_available(int proc, int aux = -1) override;
+  virtual void mark_unavailable(int proc, int aux = -1) override;
+  virtual void cancel_replay() override;
+  virtual bool is_replaying() const override;
+  virtual void metadata(const llvm::MDNode *md) override;
+  virtual bool sleepset_is_empty() const override;
+  virtual bool check_for_cycles() override;
+  virtual Trace *get_trace() const override;
+  virtual bool reset() override;
+  virtual IID<CPid> get_iid() const override;
 
-  virtual void debug_print() const ;
+  virtual void debug_print() const override;
 
-  virtual void spawn();
-  virtual void store(const SymData &ml);
-  virtual void atomic_store(const SymData &ml);
+  virtual void spawn() override;
+  virtual void store(const SymData &ml) override;
+  virtual void atomic_store(const SymData &ml) override;
   virtual void compare_exchange
-  (const SymData &sd, const SymData::block_type expected, bool success);
-  virtual void load(const SymAddrSize &ml);
-  virtual void full_memory_conflict();
-  virtual void fence();
-  virtual void join(int tgt_proc);
-  virtual void mutex_lock(const SymAddrSize &ml);
-  virtual void mutex_lock_fail(const SymAddrSize &ml);
-  virtual void mutex_trylock(const SymAddrSize &ml);
-  virtual void mutex_unlock(const SymAddrSize &ml);
-  virtual void mutex_init(const SymAddrSize &ml);
-  virtual void mutex_destroy(const SymAddrSize &ml);
-  virtual bool cond_init(const SymAddrSize &ml);
-  virtual bool cond_signal(const SymAddrSize &ml);
-  virtual bool cond_broadcast(const SymAddrSize &ml);
-  virtual bool cond_wait(const SymAddrSize &cond_ml, const SymAddrSize &mutex_ml);
-  virtual bool cond_awake(const SymAddrSize &cond_ml, const SymAddrSize &mutex_ml);
-  virtual int cond_destroy(const SymAddrSize &ml);
-  virtual void register_alternatives(int alt_count);
+  (const SymData &sd, const SymData::block_type expected, bool success) override;
+  virtual void load(const SymAddrSize &ml) override;
+  virtual void full_memory_conflict() override;
+  virtual void fence() override;
+  virtual void join(int tgt_proc) override;
+  virtual void mutex_lock(const SymAddrSize &ml) override;
+  virtual void mutex_lock_fail(const SymAddrSize &ml) override;
+  virtual void mutex_trylock(const SymAddrSize &ml) override;
+  virtual void mutex_unlock(const SymAddrSize &ml) override;
+  virtual void mutex_init(const SymAddrSize &ml) override;
+  virtual void mutex_destroy(const SymAddrSize &ml) override;
+  virtual bool cond_init(const SymAddrSize &ml) override;
+  virtual bool cond_signal(const SymAddrSize &ml) override;
+  virtual bool cond_broadcast(const SymAddrSize &ml) override;
+  virtual bool cond_wait(const SymAddrSize &cond_ml, const SymAddrSize &mutex_ml) override;
+  virtual bool cond_awake(const SymAddrSize &cond_ml, const SymAddrSize &mutex_ml) override;
+  virtual int cond_destroy(const SymAddrSize &ml) override;
+  virtual void register_alternatives(int alt_count) override;
   virtual long double estimate_trace_count() const override;
 protected:
   /* An identifier for a thread. An index into this->threads.
