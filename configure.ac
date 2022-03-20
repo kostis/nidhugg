@@ -1,12 +1,15 @@
-AC_INIT([Nidhugg], [0.2], [carl.leonardsson@gmail.com])
-m4_include([m4/ax_cxx_compile_stdcxx_11.m4])
+AC_INIT([Nidhugg], [0.2], [magnus.lang@it.uu.se])
+m4_include([m4/ax_cxx_compile_stdcxx.m4])
 m4_include([m4/ax_boost_base.m4])
+m4_include([m4/ax_boost_system.m4])
 m4_include([m4/ax_boost_unit_test_framework.m4])
 m4_include([m4/ax_llvm.m4])
 m4_include([m4/ax_git_commit.m4])
 m4_include([m4/ax_clang.m4])
 AM_INIT_AUTOMAKE([-Wall -Werror foreign])
 # AC_CONFIG_SRCDIR([TSOTraceBuilder.cpp])
+
+AM_SILENT_RULES([yes])
 
 AC_PROG_CXX
 AC_PROG_CC
@@ -15,19 +18,43 @@ AM_PROG_AR
 
 AC_LANG([C++])
 
-# Checks for C++11
-# noext to avoid sending -std=gnu++11 to clang++ (Causes problems for clang++-3.3.)
-AX_CXX_COMPILE_STDCXX_11([noext])
+# Checks for C++14
+AX_CXX_COMPILE_STDCXX(14, [noext])
 
 AX_GIT_COMMIT
 
 # Checks for libraries
-AX_BOOST_BASE([1.49])
+AX_BOOST_BASE([1.64], [], [AC_MSG_FAILURE([Boost Required!])])
 AX_BOOST_UNIT_TEST_FRAMEWORK
+AX_BOOST_SYSTEM
 AX_LLVM(,[AC_MSG_FAILURE(LLVM is required.)])
-CXXFLAGS="`echo " $CXXFLAGS " | sed 's/ -fno-rtti / /' | sed 's/ -fno-exceptions / /'`"
+CXXFLAGS="`echo " $CXXFLAGS " | sed 's/ -fno-rtti / /' | sed 's/ -fno-exceptions / /'` --std=c++14 $BOOST_CPPFLAGS"
+LDFLAGS="$LDFLAGS $BOOST_LDFLAGS"
 AC_CHECK_LIB([dl], [dlopen],[],[AC_MSG_FAILURE([Could not find library libdl.])])
-AC_CHECK_LIB([ffi], [ffi_call],[],[AC_MSG_FAILURE([Could not find library libffi.])])
+ifdef([PKG_CHECK_MODULES],[
+  PKG_CHECK_MODULES([FFI], [libffi], [
+    AC_DEFINE([HAVE_LIBFFI], [1], [Define to 1 if we have libffi])
+    CFLAGS="$CFLAGS $FFI_CFLAGS"
+    CXXFLAGS="$CXXFLAGS $FFI_CFLAGS"
+    LIBS="$LIBS $FFI_LIBS"
+  ],[
+    AC_CHECK_LIB([ffi], [ffi_call],[],[AC_MSG_FAILURE([Could not find library libffi.])])
+  ])
+  PKG_CHECK_MODULES([HWLOC], [hwloc], [
+    AC_DEFINE([HAVE_HWLOC], [1], [Define to 1 if we have hwloc])
+    CFLAGS="$CFLAGS $HWLOC_CFLAGS"
+    CXXFLAGS="$CXXFLAGS $HWLOC_CFLAGS"
+    LIBS="$LIBS $HWLOC_LIBS"
+  ],[
+    # Do nothing if not found
+  ])
+],[
+  errprint([WARNING: pkg-config not found, generating configure script without pkg-config support.
+])
+  AC_CHECK_LIB([ffi], [ffi_call],[],[AC_MSG_FAILURE([Could not find library libffi (did not try pkg-config).])])
+  AC_MSG_WARN([Configuring without hwloc because of no pkg-config.])
+])
+
 BUILDNIDHUGGC='yes'
 AC_ARG_ENABLE([nidhuggc],[AS_HELP_STRING([--disable-nidhuggc],[Don't build the script nidhuggc.])],
               [if test "x$enableval" = "xno"; then
@@ -80,6 +107,46 @@ AC_ARG_ENABLE([build-documentation],
    BUILDPDFDOCUMENTATION='no']
   )
 
+# Check if we can enable the x86 popcnt instruction
+AC_CANONICAL_HOST
+case "$host_cpu" in
+  (i?86|x86_64) popcnt_flag="-mpopcnt";;
+  (*)           popcnt_flag="no";;
+esac
+AC_ARG_ENABLE([popcnt], [AS_HELP_STRING([--disable-popcnt],[Do not try to use the popcnt instruction])] ,
+  [if test "x$enableval" != "xno"; then
+      if test "x$enableval" != "xyes"; then
+         popcnt_flag="$enableval"
+      fi
+      AC_MSG_NOTICE([Forcing popcnt usage on with flag $enableval.])
+      old_CXXFLAGS="$CXXFLAGS"
+      old_CFLAGS="$CFLAGS"
+      CFLAGS="$CFLAGS $popcnt_flag"
+      CXXFLAGS="$CXXFLAGS $popcnt_flag"
+   else
+      AC_MSG_NOTICE([Forcing popcnt usage unchanged.])
+   fi
+  ],[
+   if test "$popcnt_flag" != "no"; then
+     AC_MSG_CHECKING([If cpu supports $popcnt_flag])
+     CFLAGS="$CFLAGS $popcnt_flag"
+     CXXFLAGS="$CXXFLAGS $popcnt_flag"
+     AC_RUN_IFELSE([AC_LANG_SOURCE([[int main(int argc, char *argv[]) {
+                      return __builtin_popcount(argc-1);
+                    }]])],[AC_MSG_RESULT([yes])],[
+         AC_MSG_RESULT([no])
+         CXXFLAGS="$old_CXXFLAGS"
+         CFLAGS="$old_CFLAGS"
+       ],[
+         AC_MSG_RESULT([cross-compiling, assuming no])
+         CXXFLAGS="$old_CXXFLAGS"
+         CFLAGS="$old_CFLAGS"
+       ])
+   else
+      AC_MSG_WARN([Don't know how to enable popcount instruction for $host_cpu.])
+   fi
+  ])
+
 # Checks for header files
 AC_DEFUN([AC_CHECK_HEADERS_ALT],
 [
@@ -94,9 +161,59 @@ AC_DEFUN([AC_CHECK_HEADERS_ALT],
   fi
 ])
 
-if test "x$BOOST_UNIT_TEST_FRAMEWORK_LIB" != "x"; then
-  AC_CHECK_HEADER([boost/test/unit_test.hpp],[],[AC_MSG_FAILURE([Could not find header boost/test/unit_test.hpp.])],[AC_INCLUDES_DEFAULT])
+AC_ARG_ENABLE([timing], [Add instrumentation for measuring performance])
+if test "x$enable_timing" != "xno"; then
+  AC_CHECK_HEADER([pthread.h],[],[
+    if test "x$enable_timing" != "xyes"; then
+      AC_MSG_FAILURE([Timing instrumentation requires pthread.h.])
+    fi
+    AC_MSG_WARN([No pthread.h, so timing instrumentation will be disabled.])
+    AC_DEFINE([NO_TIMING], [1], [Define to 1 if timing should be disabled])
+  ])
+else
+  AC_MSG_NOTICE([Disabling timing instrumentation.])
+  AC_DEFINE([NO_TIMING], [1], [Define to 1 if timing should be disabled])
 fi
+
+AC_ARG_ENABLE(smtlib-consistency-check,
+              [AS_HELP_STRING([--enable-smtlib-consistency-check],
+               [Allow the use of SMTLib compatible SMT solvers as decision procedure for RF-SMC])],
+              [if test "x$enableval" != "xno" ; then
+                 enable_smtlib_consistency_check=yes
+               fi
+              ], [enable_smtlib_consistency_check="auto"])
+if test "x$enable_smtlib_consistency_check" != "xno" -a "x$ax_cv_boost_system" != "xyes"; then
+  if test "x$enable_smtlib_consistency_check" = "xyes"; then
+    AC_MSG_FAILURE([SMTLib consistency procedure requires boost-system.])
+  fi
+  AC_MSG_NOTICE([Disabling SMTLib consistency procedure for RF-SMC because boost-system is not available.])
+  AC_DEFINE([NO_SMTLIB_SOLVER], [1], [Define to 1 if timing should be disabled])
+elif test "x$enable_smtlib_consistency_check" != "xno"; then
+  AC_MSG_CHECKING([whether boost-system can compile with -fno-rtti])
+  old_CXXFLAGS="$CXXFLAGS"
+  CXXFLAGS="$CXXFLAGS -fno-rtti"
+  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <boost/process.hpp>
+]],[[
+  boost::process::ipstream out;
+  boost::process::opstream in;
+  boost::process::child c;
+  in << "hej";
+        ]])],
+        [AC_MSG_RESULT([yes])],
+        [AC_MSG_RESULT([no])
+         if test "x$enable_smtlib_consistency_check" = "xyes"; then
+           AC_MSG_FAILURE([SMTLib consistency procedure requires boost-system.])
+         fi
+         AC_MSG_NOTICE([Disabling SMTLib consistency procedure for RF-SMC because boost-system is not compatible with -fno-rtti.])
+         AC_DEFINE([NO_SMTLIB_SOLVER], [1], [Define to 1 if timing should be disabled])
+        ])
+  CXXFLAGS="$old_CXXFLAGS"
+else
+  AC_MSG_NOTICE([Disabling SMTLib consistency procedure for RF-SMC.])
+  AC_DEFINE([NO_SMTLIB_SOLVER], [1], [Define to 1 if timing should be disabled])
+fi
+
 AC_CHECK_HEADERS([ \
   stdlib.h \
   sys/types.h \
@@ -107,8 +224,6 @@ AC_CHECK_HEADERS([ \
   cassert \
   cctype \
   cmath \
-  csetjmp \
-  csignal \
   cstdio \
   cstring \
   fstream \
@@ -137,7 +252,6 @@ AC_CHECK_HEADERS([ \
   llvm/Support/CommandLine.h \
   llvm/Support/DataTypes.h \
   llvm/Support/Debug.h \
-  llvm/Support/Dwarf.h \
   llvm/Support/DynamicLibrary.h \
   llvm/Support/ErrorHandling.h \
   llvm/Support/FileSystem.h \
@@ -152,7 +266,6 @@ AC_CHECK_HEADERS([ \
   llvm/Transforms/Utils/Cloning.h
 ],[],[AC_MSG_FAILURE([Could not find necessary headers.])],[AC_INCLUDES_DEFAULT])
 
-AC_CHECK_HEADERS_ALT([llvm/Support/CallSite.h llvm/IR/CallSite.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],[AC_INCLUDES_DEFAULT])
 AC_CHECK_HEADERS_ALT([llvm/Constants.h llvm/IR/Constants.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],[AC_INCLUDES_DEFAULT])
 AC_CHECK_HEADERS_ALT([llvm/DataLayout.h llvm/IR/DataLayout.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],[AC_INCLUDES_DEFAULT])
 AC_CHECK_HEADERS_ALT([llvm/DebugInfo.h llvm/Analysis/DebugInfo.h llvm/IR/DebugInfo.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],[AC_INCLUDES_DEFAULT])
@@ -171,14 +284,18 @@ AC_CHECK_HEADERS_ALT([llvm/PassManager.h llvm/IR/PassManager.h],[],[AC_MSG_FAILU
 AC_CHECK_HEADERS_ALT([llvm/Type.h llvm/IR/Type.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],[AC_INCLUDES_DEFAULT])
 AC_CHECK_HEADERS_ALT([llvm/Assembly/PrintModulePass.h llvm/IR/IRPrintingPasses.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],[AC_INCLUDES_DEFAULT])
 AC_CHECK_HEADERS_ALT([llvm/Analysis/Verifier.h llvm/IR/Verifier.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],AC_INCLUDES_DEFAULT[])
+AC_CHECK_HEADERS_ALT([llvm/Support/Dwarf.h llvm/BinaryFormat/Dwarf.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],AC_INCLUDES_DEFAULT[])
 AC_CHECK_HEADERS_ALT([llvm/Support/ErrorOr.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],[AC_INCLUDES_DEFAULT])
 AC_CHECK_HEADERS([llvm/Support/system_error.h],[],[],[AC_INCLUDES_DEFAULT])
+AC_CHECK_HEADERS([llvm/Transforms/Utils.h],[],[],[AC_INCLUDES_DEFAULT]) # llvm >= 7
 
-AC_CHECK_HEADERS([ffi/ffi.h],[],[
-  AC_CHECK_HEADERS([ffi.h],[],[AC_MSG_FAILURE([Could not find header ffi.h.])],[AC_INCLUDES_DEFAULT])
+AC_CHECK_HEADERS([ffi.h],[],[
+  AC_CHECK_HEADERS([ffi/ffi.h],[],[AC_MSG_FAILURE([Could not find header ffi.h.])],[AC_INCLUDES_DEFAULT])
 ],[AC_INCLUDES_DEFAULT])
 
-AC_CHECK_HEADERS([valgrind/valgrind.h])
+AC_CHECK_HEADERS([ \
+  valgrind/valgrind.h
+])
 
 # Check various functions in LLVM
 
@@ -293,11 +410,8 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
 #include <llvm/IR/Instructions.h>
 #endif
 ]],[[
-  llvm::AtomicCmpXchgInst I((llvm::Value*)0,(llvm::Value*)0,(llvm::Value*)0,
-                            (llvm::AtomicOrdering)0,
-                            (llvm::AtomicOrdering)0,
-                            llvm::SynchronizationScope(llvm::CrossThread),
-                            (llvm::Instruction*)0);
+  llvm::AtomicCmpXchgInst *I = nullptr;
+  I->getSuccessOrdering();
 ]])],
            [AC_DEFINE([LLVM_CMPXCHG_SEPARATE_SUCCESS_FAILURE_ORDERING],[1],
             [Define if llvm::AtomicCmpXchgInst has separate orderings for success and failure.])
@@ -368,7 +482,20 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
            [AC_DEFINE([HAVE_LLVM_SYS_FS_OPENFLAGS],[1],
             [Define if the type llvm::sys::fs::OpenFlags exists.])
             AC_MSG_RESULT([yes])],
-           [AC_MSG_RESULT([no])])
+           [AC_MSG_RESULT([no])
+           AC_MSG_CHECKING([for llvm::sys::fs::OpenFlags (OF_None)])
+           AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <llvm/Support/FileSystem.h>
+]],[[
+  llvm::sys::fs::OpenFlags f = llvm::sys::fs::OF_None;
+  return f;
+]])],
+                             [AC_DEFINE([HAVE_LLVM_SYS_FS_OPENFLAGS],[1],
+                              [Define if the type llvm::sys::fs::OpenFlags exists.])
+                              AC_DEFINE([LLVM_SYS_FS_OPENFLAGS_PREFIX_OF],[1],
+                              [Define if the values in the enum llvm::sys::fs::OpenFlags have the names OF_*.])
+                              AC_MSG_RESULT([yes])],
+                             [AC_MSG_RESULT([no])])])
 
 ## Check if Mutexes use the method "lock" or "acquire"
 AC_MSG_CHECKING([for llvm::sys::Mutex::lock])
@@ -501,7 +628,11 @@ AC_RUN_IFELSE([AC_LANG_PROGRAM([[
 ## Check if llvm::LLVMDebugVersion is defined
 AC_MSG_CHECKING([for LLVMDebugVersion])
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#if defined(HAVE_LLVM_SUPPORT_DWARF_H)
 #include <llvm/Support/Dwarf.h>
+#elif defined(HAVE_LLVM_BINARYFORMAT_DWARF_H)
+#include <llvm/BinaryFormat/Dwarf.h>
+#endif
 ]],[[
   unsigned dbg = llvm::LLVMDebugVersion;
 ]])],
@@ -529,6 +660,30 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
          [Define if llvm considers metadata to be a value.])
         ],
         [AC_MSG_RESULT([llvm::MDOperand])])
+
+## Check the metadata version number for LLVM
+AC_MSG_CHECKING([the LLVM metadata version number])
+AC_RUN_IFELSE([AC_LANG_PROGRAM([[
+#if defined(HAVE_LLVM_IR_METADATA_H)
+#include <llvm/IR/Metadata.h>
+#elif defined(HAVE_LLVM_METADATA_H)
+#include <llvm/Metadata.h>
+#endif
+#include <iostream>
+]],[[
+  std::cout << llvm::DEBUG_METADATA_VERSION << std::endl;
+]])],
+  [VN=`./conftest$EXEEXT`
+   AC_DEFINE_UNQUOTED([LLVM_METADATA_VERSION_NUMBER],[$VN],
+             [The LLVM metadata version number.])
+   AC_DEFINE_UNQUOTED([LLVM_METADATA_VERSION_NUMBER_STR],["$VN"],
+             [The LLVM metadata version number.])
+  ],
+  [AC_MSG_RESULT(0)
+   AC_DEFINE_UNQUOTED([LLVM_METADATA_VERSION_NUMBER],[0],
+             [The LLVM metadata version number.])
+   AC_DEFINE_UNQUOTED([LLVM_METADATA_VERSION_NUMBER_STR],["0"],
+             [The LLVM metadata version number.])])
 
 ## Check if llvm.dbg.declare should take two arguments (or three)
 AC_MSG_CHECKING([for number of arguments to llvm.dbg.declare])
@@ -572,7 +727,9 @@ define i8* @p(i8* %arg){
   ret i8* null
 }
 declare void @llvm.dbg.declare(metadata, metadata) nounwind readnone
+!llvm.module.flags = !{!1}
 !0 = metadata !{i32 0}
+!1 = !{i32 2, !"Debug Info Version", i32 )" LLVM_METADATA_VERSION_NUMBER_STR R"(}
 )";
 #else
   std::string src = R"(
@@ -581,7 +738,9 @@ define i8* @p(i8* %arg){
   ret i8* null
 }
 declare void @llvm.dbg.declare(metadata, metadata) nounwind readnone
+!llvm.module.flags = !{!1}
 !0 = !{i32 0}
+!1 = !{i32 2, !"Debug Info Version", i32 )" LLVM_METADATA_VERSION_NUMBER_STR R"(}
 )";
 #endif
   llvm::Module *mod;
@@ -604,30 +763,6 @@ declare void @llvm.dbg.declare(metadata, metadata) nounwind readnone
    AC_DEFINE([LLVM_DBG_DECLARE_TWO_ARGS],[1],
    [Define if llvm.dbg.declare takes two arguments (rather than three).])],
   [AC_MSG_RESULT(3)])
-
-## Check the metadata version number for LLVM
-AC_MSG_CHECKING([the LLVM metadata version number])
-AC_RUN_IFELSE([AC_LANG_PROGRAM([[
-#if defined(HAVE_LLVM_IR_METADATA_H)
-#include <llvm/IR/Metadata.h>
-#elif defined(HAVE_LLVM_METADATA_H)
-#include <llvm/Metadata.h>
-#endif
-#include <iostream>
-]],[[
-  std::cout << llvm::DEBUG_METADATA_VERSION << std::endl;
-]])],
-  [VN=`./conftest$EXEEXT`
-   AC_DEFINE_UNQUOTED([LLVM_METADATA_VERSION_NUMBER],[$VN],
-             [The LLVM metadata version number.])
-   AC_DEFINE_UNQUOTED([LLVM_METADATA_VERSION_NUMBER_STR],["$VN"],
-             [The LLVM metadata version number.])
-  ],
-  [AC_MSG_RESULT(0)
-   AC_DEFINE_UNQUOTED([LLVM_METADATA_VERSION_NUMBER],[0],
-             [The LLVM metadata version number.])
-   AC_DEFINE_UNQUOTED([LLVM_METADATA_VERSION_NUMBER_STR],["0"],
-             [The LLVM metadata version number.])])
 
 ## Check the parameter type for ExecutionEngine::runFunction
 AC_MSG_CHECKING([for parameter type for ExecutionEngine::runFunction])
@@ -728,6 +863,18 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
          [Define if llvm::cl::getRegisteredOptions takes an argument.])],
         [AC_MSG_RESULT([no])])
 
+## Checking if llvm::cl::VersionPrinterTy takes a llvm::raw_ostream
+AC_MSG_CHECKING([if llvm::cl::VersionPrinterTy takes a llvm::raw_ostream.])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <llvm/Support/CommandLine.h>
+]],[[
+  void (*vpr)(llvm::raw_ostream&);
+  llvm::cl::SetVersionPrinter(vpr);
+]])],
+        [AC_MSG_RESULT([yes])
+         AC_DEFINE([LLVM_CL_VERSIONPRINTER_TAKES_RAW_OSTREAM],[1],
+         [Define if llvm::cl::VersionPrinterTy takes a llvm::raw_ostream.])],
+        [AC_MSG_RESULT([no])])
 
 ## Check if loads in assembly should explicitly state their return type
 AC_MSG_CHECKING([if assembly loads explicitly state their return type])
@@ -867,6 +1014,20 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
    [Define if the DataLayout field of ExecutionEngine is a pointer.])],
   [AC_MSG_RESULT([no])])
 
+## Check if llvm::LoopInfo::erase exists
+AC_MSG_CHECKING([for llvm::LoopInfo::erase])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <llvm/Analysis/LoopPass.h>
+]],[[
+  llvm::Loop * L = 0;
+  llvm::LoopInfo *LI = 0;
+  LI->erase(L);
+]])],
+  [AC_MSG_RESULT([yes])
+   AC_DEFINE([HAVE_LLVM_LOOPINFO_ERASE],[1],
+   [Define if llvm::LoopInfo::erase exists])],
+  [AC_MSG_RESULT([no])])
+
 ## Check if llvm::LoopInfo::markAsRemoved exists
 AC_MSG_CHECKING([for llvm::LoopInfo::markAsRemoved])
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
@@ -952,10 +1113,98 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
          AC_MSG_RESULT([yes])],
         [AC_MSG_RESULT([no])])
 
+## Check whether functions use llvm::AttributeList
+AC_MSG_CHECKING([whether functions use llvm::AttributeList])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#if defined(HAVE_LLVM_IR_MODULE_H)
+#include <llvm/IR/Module.h>
+#elif defined(HAVE_LLVM_MODULE_H)
+#include <llvm/Module.h>
+#endif
+]],[[
+  llvm::Module *M = nullptr;
+  llvm::AttributeList assumeAttrs =
+    llvm::AttributeList::get(M->getContext(),llvm::AttributeList::FunctionIndex,
+                             std::vector<llvm::Attribute::AttrKind>({llvm::Attribute::NoUnwind}));
+]])],
+        [AC_DEFINE([LLVM_HAS_ATTRIBUTELIST],[1],
+         [Define if llvm::AttributeList exists.])
+         AC_MSG_RESULT([yes])],
+        [AC_MSG_RESULT([no])])
+
+## Check whether llvm::SwitchInst::CaseIt needs dereference
+AC_MSG_CHECKING([whether llvm::SwitchInst::CaseIt needs dereference])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#if defined(HAVE_LLVM_IR_INSTRUCTIONS_H)
+#include <llvm/IR/Instructions.h>
+#elif defined(HAVE_LLVM_INSTRUCTIONS_H)
+#include <llvm/Instructions.h>
+#endif
+]],[[
+  llvm::SwitchInst::CaseIt *i = nullptr;
+  (*i)->getCaseValue();
+]])],
+        [AC_DEFINE([LLVM_SWITCHINST_CASEIT_NEEDS_DEREFERENCE],[1],
+         [Define if llvm::SwitchInst::CaseIt should be dereferenced.])
+         AC_MSG_RESULT([yes])],
+        [AC_MSG_RESULT([no])])
+
+## Check whether the llvm::TerminatorInst class exists (LLVM<8)
+AC_MSG_CHECKING([for llvm::TerminatorInst])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#if defined(HAVE_LLVM_IR_INSTRUCTIONS_H)
+#include <llvm/IR/Instructions.h>
+#elif defined(HAVE_LLVM_INSTRUCTIONS_H)
+#include <llvm/Instructions.h>
+#endif
+]],[[
+  llvm::TerminatorInst *I = nullptr;
+]])],
+        [AC_DEFINE([LLVM_HAS_TERMINATORINST],[1],
+         [Define if llvm::TerminatorInst exists.])
+         AC_MSG_RESULT([yes])],
+        [AC_MSG_RESULT([no])])
+
+## Check whether the class llvm::CallBase exists (LLVM>=7)
+AC_MSG_CHECKING([for class llvm::CallBase])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#if defined(HAVE_LLVM_IR_INSTRUCTIONS_H)
+#include <llvm/IR/Instructions.h>
+#elif defined(HAVE_LLVM_INSTRUCTIONS_H)
+#include <llvm/Instructions.h>
+#endif
+]],[[
+  llvm::CallInst *CI = nullptr;
+  llvm::CallBase *CB = CI;
+]])],
+        [AC_DEFINE([LLVM_HAS_CALLBASE],[1],
+         [Define if llvm::CallBase exists.])
+         AC_MSG_RESULT([yes])],
+        [AC_MSG_RESULT([no])
+         AC_CHECK_HEADERS_ALT([llvm/Support/CallSite.h llvm/IR/CallSite.h],[],[AC_MSG_FAILURE([Could not find necessary headers.])],[AC_INCLUDES_DEFAULT])])
+
+## Check whether we have TypeIDs for scalable vector types (LLVM>=11)
+AC_MSG_CHECKING([for llvm vector TypeIDs])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#if defined(HAVE_LLVM_IR_INSTRUCTIONS_H)
+#include <llvm/IR/Instructions.h>
+#elif defined(HAVE_LLVM_INSTRUCTIONS_H)
+#include <llvm/Instructions.h>
+#endif
+]],[[
+  llvm::Type *T = nullptr;
+  bool isVector = T->getTypeID() == llvm::Type::VectorTyID;
+]])],
+        [AC_DEFINE([LLVM_VECTOR_TYPEID_CASES],[case llvm::Type::VectorTyID:],
+         [Case labels for recognising vector types.])
+         AC_MSG_RESULT([VectorTyID])],
+        [AC_DEFINE([LLVM_VECTOR_TYPEID_CASES],
+         [case llvm::Type::FixedVectorTyID: case llvm::Type::ScalableVectorTyID:],
+         [Case labels for recognising vector types.])
+         AC_MSG_RESULT([FixedVectorTyID, ScalableVectorTyID])])
+
 
 # Checks for typedefs, structures, and compiler characteristics.
-#AC_CHECK_HEADER_STDBOOL macro is defined with autoconf version >= 2.67
-m4_ifdef([AC_CHECK_HEADER_STDBOOL], [AC_CHECK_HEADER_STDBOOL])
 AC_C_INLINE
 AC_TYPE_INT16_T
 AC_TYPE_INT32_T
@@ -984,10 +1233,6 @@ fi
 AC_SUBST(NIDHUGGCBIN)
 AM_CONDITIONAL([BUILDPDFDOCUMENTATION],[test "x$BUILDPDFDOCUMENTATION" = "xyes"])
 
-# Checks for library functions.
-AC_FUNC_MALLOC
-AC_CHECK_FUNCS([atexit memset setenv])
-
 # Warn about compiling with clang++ for llvm version >= 3.9
 if test "x$CXX" = "xclang" || test "x$CXX" = "xclang++" ; then
   # Version comparison using sort -V
@@ -1000,6 +1245,7 @@ if test "x$CXX" = "xclang" || test "x$CXX" = "xclang++" ; then
   fi
 fi
 
+AM_EXTRA_RECURSIVE_TARGETS([test run_unittest valtest litmus_test smoke_test])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_FILES([
   Makefile

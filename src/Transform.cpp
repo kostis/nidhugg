@@ -18,8 +18,12 @@
  */
 
 #include "AddLibPass.h"
-#include "LoopUnrollPass.h"
+#include "LoopBoundPass.h"
 #include "SpinAssumePass.h"
+#include "DeadCodeElimPass.h"
+#include "CastElimPass.h"
+#include "PartialLoopPurityPass.h"
+#include "AssumeAwaitPass.h"
 #include "StrModule.h"
 #include "Transform.h"
 
@@ -35,6 +39,12 @@
 #endif
 #if defined(HAVE_LLVM_IR_LEGACYPASSMANAGER_H) && defined(LLVM_PASSMANAGER_TEMPLATE)
 #include <llvm/IR/LegacyPassManager.h>
+#endif
+#include <llvm/InitializePasses.h>
+#ifdef HAVE_LLVM_TRANSFORMS_UTILS_H
+#  include <llvm/Transforms/Utils.h>
+#else
+#  include <llvm/Transforms/Scalar.h>
 #endif
 
 #include <stdexcept>
@@ -55,6 +65,21 @@ namespace Transform {
     StrModule::write_module(mod,outfile);
   }
 
+  namespace {
+    struct ClearOptnonePass : public llvm::FunctionPass {
+      static char ID;
+      ClearOptnonePass() : llvm::FunctionPass(ID) {}
+      bool runOnFunction(llvm::Function &F) override {
+        if (F.hasFnAttribute(llvm::Attribute::OptimizeNone)) {
+          F.removeFnAttr(llvm::Attribute::OptimizeNone);
+          return true;
+        }
+        return false;
+      }
+    };
+    char ClearOptnonePass::ID = 0;
+  }
+
   bool transform(llvm::Module &mod, const Configuration &conf){
     llvm::PassRegistry &Registry = *llvm::PassRegistry::getPassRegistry();
     llvm::initializeCore(Registry);
@@ -72,19 +97,39 @@ namespace Transform {
     llvm::initializeTarget(Registry);
 
 #ifdef LLVM_PASSMANAGER_TEMPLATE
-    llvm::legacy::PassManager PM;
+    using PassManager = llvm::legacy::PassManager;
 #else
-    llvm::PassManager PM;
+    using PassManager = llvm::PassManager;
 #endif
-    if(conf.transform_spin_assume){
+    PassManager PM;
+    /* Run some safe simplifications that both improve applicability
+     * of our passes, and speed up model checking.
+     * We need to clear the "optnone" attribute set by clang, or all the
+     * optimizers will no-op.
+     */
+    PM.add(new ClearOptnonePass());
+    PM.add(llvm::createPromoteMemoryToRegisterPass());
+    if (conf.transform_cast_elim) {
+      PM.add(new CastElimPass());
+    }
+    if (conf.transform_dead_code_elim) {
+      PM.add(new DeadCodeElimPass());
+    }
+    if (conf.transform_partial_loop_purity) {
+      PM.add(new PartialLoopPurityPass());
+    }
+    if (conf.transform_spin_assume){
       PM.add(new SpinAssumePass());
     }
-    if(0 <= conf.transform_loop_unroll){
-      PM.add(new LoopUnrollPass(conf.transform_loop_unroll));
+    if (conf.transform_loop_unroll >= 0) {
+      PM.add(new LoopBoundPass(conf.transform_loop_unroll));
+    }
+    if(conf.transform_assume_await){
+      PM.add(new AssumeAwaitPass());
     }
     PM.add(new AddLibPass());
     bool modified = PM.run(mod);
-    assert(!llvm::verifyModule(mod));
+    assert(!llvm::verifyModule(mod, &llvm::dbgs()));
     return modified;
   }
 

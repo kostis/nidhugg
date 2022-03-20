@@ -27,40 +27,48 @@
 class PSOTraceBuilder : public TSOPSOTraceBuilder{
 public:
   PSOTraceBuilder(const Configuration &conf = Configuration::default_conf);
-  virtual ~PSOTraceBuilder();
-  virtual bool schedule(int *proc, int *aux, int *alt, bool *dryrun);
-  virtual void refuse_schedule();
-  virtual void mark_available(int proc, int aux = -1);
-  virtual void mark_unavailable(int proc, int aux = -1);
-  virtual void metadata(const llvm::MDNode *md);
-  virtual bool sleepset_is_empty() const;
-  virtual bool check_for_cycles();
-  virtual Trace *get_trace() const;
-  virtual bool reset();
-  virtual IID<CPid> get_iid() const;
+  virtual ~PSOTraceBuilder() override;
+  virtual bool schedule(int *proc, int *aux, int *alt, bool *dryrun) override;
+  virtual void refuse_schedule() override;
+  virtual void mark_available(int proc, int aux = -1) override;
+  virtual void mark_unavailable(int proc, int aux = -1) override;
+  virtual void cancel_replay() override;
+  virtual bool is_replaying() const override;
+  virtual void metadata(const llvm::MDNode *md) override;
+  virtual bool sleepset_is_empty() const override;
+  virtual bool check_for_cycles() override;
+  virtual Trace *get_trace() const override;
+  virtual bool reset() override;
+  virtual IID<CPid> get_iid() const override;
 
-  virtual void debug_print() const ;
+  virtual void debug_print() const  override;
 
-  virtual void spawn();
-  virtual void store(const ConstMRef &ml);
-  virtual void atomic_store(const ConstMRef &ml);
-  virtual void load(const ConstMRef &ml);
-  virtual void full_memory_conflict();
-  virtual void fence();
-  virtual void join(int tgt_proc);
-  virtual void mutex_lock(const ConstMRef &ml);
-  virtual void mutex_lock_fail(const ConstMRef &ml);
-  virtual void mutex_trylock(const ConstMRef &ml);
-  virtual void mutex_unlock(const ConstMRef &ml);
-  virtual void mutex_init(const ConstMRef &ml);
-  virtual void mutex_destroy(const ConstMRef &ml);
-  virtual bool cond_init(const ConstMRef &ml);
-  virtual bool cond_signal(const ConstMRef &ml);
-  virtual bool cond_broadcast(const ConstMRef &ml);
-  virtual bool cond_wait(const ConstMRef &cond_ml, const ConstMRef &mutex_ml);
-  virtual int cond_destroy(const ConstMRef &ml);
-  virtual void register_alternatives(int alt_count);
-  virtual int estimate_trace_count() const;
+  virtual NODISCARD bool spawn() override;
+  virtual NODISCARD bool store(const SymData &ml) override;
+  virtual NODISCARD bool atomic_store(const SymData &ml) override;
+  virtual NODISCARD bool compare_exchange
+  (const SymData &sd, const SymData::block_type expected, bool success)
+      override;
+  virtual NODISCARD bool load(const SymAddrSize &ml) override;
+  virtual NODISCARD bool full_memory_conflict() override;
+  virtual NODISCARD bool fence() override;
+  virtual NODISCARD bool join(int tgt_proc) override;
+  virtual NODISCARD bool mutex_lock(const SymAddrSize &ml) override;
+  virtual NODISCARD bool mutex_lock_fail(const SymAddrSize &ml) override;
+  virtual NODISCARD bool mutex_trylock(const SymAddrSize &ml) override;
+  virtual NODISCARD bool mutex_unlock(const SymAddrSize &ml) override;
+  virtual NODISCARD bool mutex_init(const SymAddrSize &ml) override;
+  virtual NODISCARD bool mutex_destroy(const SymAddrSize &ml) override;
+  virtual NODISCARD bool cond_init(const SymAddrSize &ml) override;
+  virtual NODISCARD bool cond_signal(const SymAddrSize &ml) override;
+  virtual NODISCARD bool cond_broadcast(const SymAddrSize &ml) override;
+  virtual NODISCARD bool cond_wait(const SymAddrSize &cond_ml,
+                         const SymAddrSize &mutex_ml) override;
+  virtual NODISCARD bool cond_awake(const SymAddrSize &cond_ml,
+                          const SymAddrSize &mutex_ml) override;
+  virtual NODISCARD int cond_destroy(const SymAddrSize &ml) override;
+  virtual NODISCARD bool register_alternatives(int alt_count) override;
+  virtual long double estimate_trace_count() const override;
 protected:
   /* An identifier for a thread. An index into this->threads.
    *
@@ -82,24 +90,24 @@ protected:
     /* The type of memory access. */
     enum Type {R, W, W_ALL_MEMORY, NA} type;
     /* The accessed byte. */
-    const void *ml;
+    SymAddr ml;
     bool operator<(const Access &a) const{
       return type < a.type || (type == a.type && ml < a.ml);
     };
     bool operator==(const Access &a) const{
       return type == a.type && (type == NA || ml == a.ml);
     };
-    Access() : type(NA), ml(0) {};
-    Access(Type t, const void *m) : type(t), ml(m) {};
+    Access() : type(NA), ml(SymMBlock::Global(0),0) {};
+    Access(Type t, SymAddr m) : type(t), ml(m) {};
   };
 
   /* A byte of a store pending in a store buffer. */
   class PendingStoreByte{
   public:
-    PendingStoreByte(const ConstMRef &ml, const VClock<IPid> &clk, const llvm::MDNode *md)
+    PendingStoreByte(const SymAddrSize &ml, const VClock<IPid> &clk, const llvm::MDNode *md)
       : ml(ml), clock(clk), last_rowe(-1), md(md) {};
     /* The memory location that is being written to. */
-    ConstMRef ml;
+    SymAddrSize ml;
     /* The clock of the store event which produced this store buffer
      * entry.
      */
@@ -143,8 +151,8 @@ protected:
      * auxiliary thread indices and the first byte in the memory
      * locations for which that auxiliary thread is responsible.
      */
-    std::vector<void const*> aux_to_byte;
-    std::map<void const*,int> byte_to_aux;
+    std::vector<SymAddr> aux_to_byte;
+    std::map<SymAddr,int> byte_to_aux;
     /* For each auxiliary thread i of this thread, aux_to_ipid[i] is
      * the corresponding IPid.
      */
@@ -159,7 +167,7 @@ protected:
      * The store buffer is kept in the Thread object for the real
      * thread, not for the auxiliary.
      */
-    std::map<void const*,std::vector<PendingStoreByte> > store_buffers;
+    std::map<SymAddr,std::vector<PendingStoreByte> > store_buffers;
     /* For a non-auxiliary thread, aux_clock_sum is the sum of the
      * clocks of all auxiliary threads belonging to this thread.
      */
@@ -172,14 +180,14 @@ protected:
      *
      * Empty if !sleeping.
      */
-    VecSet<void const *> sleep_accesses_r;
+    VecSet<SymAddr> sleep_accesses_r;
     /* sleep_accesses_w is the set of bytes that will be written by
      * the next event to be executed by this thread (as determined by
      * dry running).
      *
      * Empty if !sleeping.
      */
-    VecSet<void const *> sleep_accesses_w;
+    VecSet<SymAddr> sleep_accesses_w;
     /* sleep_full_memory_conflict is set when the next event to be
      * executed by this thread will be a full memory conflict (as
      * determined by dry running).
@@ -229,7 +237,7 @@ protected:
    */
   class ByteInfo{
   public:
-    ByteInfo() : last_update(-1), last_update_ml(0,1) {};
+    ByteInfo() : last_update(-1), last_update_ml({SymMBlock::Global(0),0},1) {};
     /* An index into prefix, to the latest update that accessed this
      * byte. last_update == -1 if there has been no update to this
      * byte.
@@ -239,7 +247,7 @@ protected:
      * accessed by the last update. Undefined if there has been no
      * update to this byte.
      */
-    ConstMRef last_update_ml;
+    SymAddrSize last_update_ml;
     /* last_read[tid] is the index in prefix of the latest (visible)
      * read of the thread with IPid tid to this memory location, or -1
      * if thread tid has not read this memory location.
@@ -263,7 +271,7 @@ protected:
       std::vector<int>::const_iterator end() const { return v.end(); };
     } last_read;
   };
-  std::map<const void*,ByteInfo> mem;
+  std::map<SymAddr,ByteInfo> mem;
   /* Index into prefix pointing to the latest full memory conflict.
    * -1 if there has been no full memory conflict.
    */
@@ -273,16 +281,17 @@ protected:
    */
   class Mutex{
   public:
-    Mutex() : last_access(-1), last_lock(-1) {};
-    Mutex(int lacc) : last_access(lacc), last_lock(-1) {};
+    Mutex() : last_access(-1), last_lock(-1), locked(false) {};
+    Mutex(int lacc) : last_access(lacc), last_lock(-1), locked(false) {};
     int last_access;
     int last_lock;
+    bool locked;
   };
   /* A map containing all pthread mutex objects in the current
    * execution. The key is the position in memory of the actual
    * pthread_mutex_t object.
    */
-  std::map<void const*,Mutex> mutexes;
+  std::map<SymAddr,Mutex> mutexes;
 
   /* A CondVar represents a pthread_cond_t object. */
   class CondVar{
@@ -306,7 +315,7 @@ protected:
    * current execution. The key is the position in memory of the
    * actual pthread_cond_t object.
    */
-  std::map<void const*,CondVar> cond_vars;
+  std::map<SymAddr,CondVar> cond_vars;
 
   /* A Branch object is a pair of an IPid p and an alternative index
    * (see Event::alt below) i. It will be tagged on an event in the
@@ -381,7 +390,7 @@ protected:
      * explored. sleep_branch_trace_count is the total number of such
      * explored traces.
      */
-    int sleep_branch_trace_count;
+    uint64_t sleep_branch_trace_count;
   };
 
   /* The fixed prefix of events in the current execution. This may be
@@ -450,11 +459,11 @@ protected:
   VecSet<IPid> sleep_set_at(int i);
   /* Wake up all threads which are sleeping, waiting for an access
    * (type,ml). */
-  void wakeup(Access::Type type, void const *ml);
+  void wakeup(Access::Type type, SymAddr ml);
   /* Returns true iff the thread pid has a pending store to some
    * memory location including the byte ml.
    */
-  bool has_pending_store(IPid pid, void const *ml) const;
+  bool has_pending_store(IPid pid, SymAddr ml) const;
   /* Helper for check_for_cycles. */
   bool has_cycle(IID<IPid> *loc) const;
   /* Returns true when it is possible to perform a memory update from
@@ -471,7 +480,7 @@ protected:
   /* Estimate the total number of traces that have the same prefix as
    * the current one, up to the first idx events.
    */
-  int estimate_trace_count(int idx) const;
+  long double estimate_trace_count(int idx) const;
   /* Same as mark_available, but takes an IPid as thread
    * identifier.
    */

@@ -41,14 +41,11 @@
 #include "CPid.h"
 #include "POWERARMTraceBuilder.h"
 #include "vecset.h"
+#include "DPORInterpreter.h"
+#include "AnyCallInst.h"
 
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
-#if defined(HAVE_LLVM_SUPPORT_CALLSITE_H)
-#include <llvm/Support/CallSite.h>
-#elif defined(HAVE_LLVM_IR_CALLSITE_H)
-#include <llvm/IR/CallSite.h>
-#endif
 #if defined(HAVE_LLVM_IR_DATALAYOUT_H)
 #include <llvm/IR/DataLayout.h>
 #elif defined(HAVE_LLVM_DATALAYOUT_H)
@@ -79,7 +76,7 @@ namespace llvm{
 
 // Interpreter - This class represents the entirety of the interpreter.
 //
-class POWERInterpreter : public llvm::ExecutionEngine, public llvm::InstVisitor<POWERInterpreter> {
+class POWERInterpreter : public DPORInterpreter, public llvm::InstVisitor<POWERInterpreter> {
 public:
   typedef llvm::generic_gep_type_iterator<llvm::User::const_op_iterator> gep_type_iterator;
 
@@ -231,6 +228,8 @@ private:
   };
   std::vector<Thread> Threads;
   int CurrentThread;
+  /* Whether any thread has been blocked without terminating */
+  bool Blocked = false;
   CPidSystem CPS;
   std::vector<std::shared_ptr<FetchedInstruction> > CommittableLocal;
   std::shared_ptr<FetchedInstruction> CurInstr;
@@ -240,9 +239,9 @@ private:
   std::vector<llvm::Function*> AtExitHandlers;
 
   /* A dummy store of the value 0 (int32) to null. */
-  llvm::Instruction *dummy_store;
+  llvm::StoreInst *dummy_store;
   /* A dummy load from null (int8*). */
-  llvm::Instruction *dummy_load8;
+  llvm::LoadInst *dummy_load8;
 
 public:
   explicit POWERInterpreter(llvm::Module *M, POWERARMTraceBuilder &TB,
@@ -256,9 +255,10 @@ public:
 
   /// Create an interpreter ExecutionEngine.
   ///
-  static llvm::ExecutionEngine *create(llvm::Module *M, POWERARMTraceBuilder &TB,
-                                       const Configuration &conf = Configuration::default_conf,
-                                       std::string *ErrorStr = nullptr);
+  static std::unique_ptr<POWERInterpreter>
+  create(llvm::Module *M, POWERARMTraceBuilder &TB,
+         const Configuration &conf = Configuration::default_conf,
+         std::string *ErrorStr = nullptr);
 
   /// run - Start execution with the specified function and arguments.
   ///
@@ -326,9 +326,12 @@ public:
   void visitSelectInst(llvm::SelectInst &I);
 
 
-  void visitCallSite(llvm::CallSite CS);
-  void visitCallInst(llvm::CallInst &I) { visitCallSite (llvm::CallSite (&I)); }
-  void visitInvokeInst(llvm::InvokeInst &I) { visitCallSite (llvm::CallSite (&I)); }
+  virtual void visitAnyCallInst(AnyCallInst CI);
+#ifdef LLVM_HAS_CALLBASE
+  virtual void visitCallBase(llvm::CallBase &CB) { visitAnyCallInst(CB); }
+#else
+  virtual void visitCallSite(llvm::CallSite CS) { visitAnyCallInst(CS); }
+#endif
   void visitUnreachableInst(llvm::UnreachableInst &I);
 
   void visitShl(llvm::BinaryOperator &I);
@@ -342,7 +345,7 @@ public:
 
   void visitExtractValueInst(llvm::ExtractValueInst &I);
   void visitInsertValueInst(llvm::InsertValueInst &I);
-  void visitInlineAsm(llvm::CallSite &CS, const std::string &asmstr);
+  void visitInlineAsm(llvm::CallInst &CI, const std::string &asmstr);
 
   void visitInstruction(llvm::Instruction &I) {
     llvm::errs() << I << "\n";
@@ -490,7 +493,7 @@ private:  // Helper functions
    * If CS is a call to inline assembly, then *asmstr is assigned the
    * assembly string.
    */
-  bool isInlineAsm(llvm::CallSite &CS, std::string *asmstr);
+  bool isInlineAsm(AnyCallInst CI, std::string *asmstr);
   bool isInlineAsm(llvm::Instruction &CS, std::string *asmstr);
 
   /* Force termination from all running threads, thereby terminating
@@ -508,7 +511,7 @@ private:  // Helper functions
    */
   void callAssertFail(llvm::Function *F);
   void callAssume(llvm::Function *F);
-  void callMalloc(llvm::Function *F);
+  void callMCalloc(llvm::Function *F, bool isCalloc);
   void callPthreadCreate(llvm::Function *F);
   void callPthreadExit(llvm::Function *F);
   void callPthreadJoin(llvm::Function *F);

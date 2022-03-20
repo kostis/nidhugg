@@ -34,16 +34,17 @@ public:
                           const Configuration &conf = Configuration::default_conf);
   virtual ~TSOInterpreter();
 
-  static llvm::ExecutionEngine *create(llvm::Module *M, TSOTraceBuilder &TB,
-                                 const Configuration &conf = Configuration::default_conf,
-                                 std::string *ErrorStr = 0);
+  static std::unique_ptr<TSOInterpreter>
+  create(llvm::Module *M, TSOTraceBuilder &TB,
+         const Configuration &conf = Configuration::default_conf,
+         std::string *ErrorStr = 0);
 
   virtual void visitLoadInst(llvm::LoadInst &I);
   virtual void visitStoreInst(llvm::StoreInst &I);
   virtual void visitFenceInst(llvm::FenceInst &I);
   virtual void visitAtomicCmpXchgInst(llvm::AtomicCmpXchgInst &I);
   virtual void visitAtomicRMWInst(llvm::AtomicRMWInst &I);
-  virtual void visitInlineAsm(llvm::CallSite &CS, const std::string &asmstr);
+  virtual void visitInlineAsm(llvm::CallInst &CI, const std::string &asmstr);
 protected:
   virtual void runAux(int proc, int aux);
   virtual int newThread(const CPid &cpid);
@@ -60,7 +61,7 @@ protected:
     /* The TSO store buffer of this thread. Newer entries are further
      * to the back.
      */
-    std::vector<MBlock> store_buffer;
+    std::vector<std::pair<void*,SymData>> store_buffer;
     /* When partial_buffer_flush >= 0, it signals that this thread is
      * blocked, waiting for its store buffer update to memory. The
      * thread will continue to be blocked until the size of its store

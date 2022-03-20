@@ -23,9 +23,12 @@
 #define __CONFIGURATION_H__
 
 #include "vecset.h"
+#include "SatSolver.h"
+#include "Option.h"
 
 #include <set>
 #include <string>
+#include <memory>
 
 /* A Configuration object keeps track of all configuration options
  * that should be used during a program analysis. The configuration
@@ -42,13 +45,22 @@ public:
     PSO,
     TSO
   };
+  enum DPORAlgorithm{
+    SOURCE,
+    OPTIMAL,
+    OBSERVERS,
+    READS_FROM,
+  };
   /* Assign default values to all configuration parameters. */
   Configuration(){
+    n_threads = 1;
     explore_all_traces = false;
     malloc_may_fail = false;
     mutex_require_init = true;
     max_search_depth = -1;
     memory_model = MM_UNDEF;
+    c11 = false;
+    dpor_algorithm = SOURCE;
     extfun_no_fence = {
       "pthread_self",
       "malloc",
@@ -80,10 +92,19 @@ public:
     debug_collect_all_traces = false;
     debug_print_on_reset = false;
     debug_print_on_error = false;
-    transform_spin_assume = true;
+    transform_spin_assume = false;
+    transform_assume_await = false;
     transform_loop_unroll = -1;
+    svcomp_nondet_int = nullptr;
     print_progress = false;
     print_progress_estimate = false;
+    exploration_scheduler = WORKSTEALING;
+#ifdef NO_SMTLIB_SOLVER
+    sat_solver = NONE;
+#else
+    sat_solver = SMTLIB;
+#endif
+    argv.push_back(get_default_program_name());
   };
   /* Read the switches given to the program by the user. Assign
    * configuration options accordingly.
@@ -117,6 +138,10 @@ public:
   int max_search_depth;
   /* Which memory model should be assumed? */
   MemoryModel memory_model;
+  /* Should non-atomic accesses be ignored? */
+  bool c11;
+  /* Which DPOR algorithm should be used? */
+  DPORAlgorithm dpor_algorithm;
   /* A set of names of external functions that should be assumed to
    * not have fencing behavior. Notice however that the function
    * itself will still execute atomically, which may cause behaviors
@@ -161,11 +186,23 @@ public:
   bool debug_print_on_error;
   /* In module transformation, enable the SpinAssume pass. */
   bool transform_spin_assume;
+  /* In module transformation, enable the DeadCodeElim pass. */
+  bool transform_dead_code_elim = true;
+  /* In module transformation, enable the CastElim pass. */
+  bool transform_cast_elim = true;
+  /* In module transformation, enable the PartialLoopPurity pass. */
+  bool transform_partial_loop_purity = true;
+  /* In module transformation, enable the AssumeAwait pass. */
+  bool transform_assume_await;
   /* If transform_loop_unroll is non-negative, in module
    * transformation, enable loop unrolling with depth
    * transform_loop_unroll.
    */
   int transform_loop_unroll;
+  /* Number to return from __VERIFIER_nondet_u?int() */
+  Option<int> svcomp_nondet_int;
+  /* If set, rmws are allowed to commute. */
+  bool commute_rmws = false;
   /* If set, DPORDriver will continually print its progress to stdout. */
   bool print_progress;
   /* If set and print_progress is set, DPORDriver will together with
@@ -174,6 +211,36 @@ public:
    */
   bool print_progress_estimate;
 
+  /* When running RFSC, Set the amount of threads that does the exploration.
+   * The main thread will only consume results from the n-1 worker threads.
+   * If n=1 the algorithm operates purely sequential.
+   */
+  int n_threads;
+
+  /* Scheduler to use when exploring in parallel with --n-threads */
+  enum ExplorationScheduler {
+    PRIOQUEUE,
+    WORKSTEALING,
+  } exploration_scheduler;
+
+  /* Sat solver to use. */
+  enum SatSolverEnum {
+#ifdef NO_SMTLIB_SOLVER
+        NONE,
+#else
+        SMTLIB,
+#endif
+  } sat_solver;
+  std::unique_ptr<SatSolver> get_sat_solver() const;
+  /* The arguments that will be passed to the program under test */
+  std::vector<std::string> argv;
+  /* The default program name to send to the program under test as
+   * argv[0].
+   */
+  static const std::string &get_default_program_name(){
+    static const std::string pname = "a.out";
+    return pname;
+  }
   /* The set of all commandline switches that are associated with
    * setting configuration options. This set has nothing to do with
    * which switches were actually given by the user.

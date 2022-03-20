@@ -87,6 +87,28 @@ void POWERInterpreter::setCurInstrValue(const llvm::GenericValue &Val) {
   CurInstr->Value = Val;
 }
 
+static llvm::GenericValue tid_to_pthread_t(const llvm::Type *pthrtty, int tid) {
+  if (pthrtty->isIntegerTy()) {
+    llvm::GenericValue TIDVal;
+    TIDVal.IntVal = llvm::APInt(pthrtty->getIntegerBitWidth(),tid);
+    return TIDVal;
+  } else {
+    return llvm::PTOGV((void*)(intptr_t)tid);
+  }
+}
+
+static int pthread_t_to_tid(const llvm::Type *pthrtty, const llvm::GenericValue &TID) {
+  if (pthrtty->isIntegerTy()) {
+    return TID.IntVal.getLimitedValue(std::numeric_limits<int>::max());
+  } else {
+    intptr_t ptri = (intptr_t)llvm::GVTOP(TID);
+    if (ptri > std::numeric_limits<int>::max())
+      return std::numeric_limits<int>::max();
+    else
+      return (int)ptri;
+  }
+}
+
 //===----------------------------------------------------------------------===//
 //                    Binary Instruction Implementations
 //===----------------------------------------------------------------------===//
@@ -161,7 +183,7 @@ static void executeFRemInst(llvm::GenericValue &Dest, llvm::GenericValue Src1,
   break;
 
 #define IMPLEMENT_VECTOR_INTEGER_ICMP(OP, TY)                           \
-  case llvm::Type::VectorTyID: {                                        \
+  LLVM_VECTOR_TYPEID_CASES {                                            \
     assert(Src1.AggregateVal.size() == Src2.AggregateVal.size());       \
     Dest.AggregateVal.resize( Src1.AggregateVal.size() );               \
     for( uint32_t _i=0;_i<Src1.AggregateVal.size();_i++)                \
@@ -358,7 +380,7 @@ void POWERInterpreter::visitICmpInst(llvm::ICmpInst &I) {
   break;
 
 #define IMPLEMENT_VECTOR_FCMP(OP)                                       \
-  case llvm::Type::VectorTyID:                                          \
+  LLVM_VECTOR_TYPEID_CASES                                              \
   if(llvm::dyn_cast<llvm::VectorType>(Ty)->getElementType()->isFloatTy()) { \
     IMPLEMENT_VECTOR_FCMP_T(OP, Float);                                 \
   } else {                                                              \
@@ -964,16 +986,21 @@ void POWERInterpreter::visitSwitchInst(llvm::SwitchInst &I) {
   const unsigned nc = I.getNumCases();
   llvm::SwitchInst::CaseIt cit = I.case_begin();
   for(unsigned i = 0; i < nc; ++i, ++cit){
+#ifdef LLVM_SWITCHINST_CASEIT_NEEDS_DEREFERENCE
+    auto &cv = *cit;
+#else
+    auto &cv = cit;
+#endif
     llvm::GenericValue CaseVal = getOperandValue(2*i+2);
     if(CaseVal.AggregateVal.size()){
       assert(CaseVal.AggregateVal.size() == 1);
       assert(CaseVal.AggregateVal[0].AggregateVal.size() == 2);
       CaseVal = CaseVal.AggregateVal[0].AggregateVal[0];
     }else{
-      assert(I.getOperand(2*i+2) == cit.getCaseValue());
+      assert(I.getOperand(2*i+2) == cv.getCaseValue());
     }
     if(executeICMP_EQ(CondVal, CaseVal, ElTy).IntVal != 0){
-      Dest = llvm::cast<llvm::BasicBlock>(cit.getCaseSuccessor());
+      Dest = llvm::cast<llvm::BasicBlock>(cv.getCaseSuccessor());
       break;
     }
   }
@@ -1118,12 +1145,11 @@ static void stripws(std::string &s){
   s = s.substr(first,len);
 }
 
-bool POWERInterpreter::isInlineAsm(llvm::CallSite &CS, std::string *asmstr){
-  if(CS.isCall()){
-    llvm::CallInst *CI = llvm::cast<llvm::CallInst>(CS.getInstruction());
+bool POWERInterpreter::isInlineAsm(AnyCallInst CS, std::string *asmstr){
+  if(llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(&CS)){
     if(CI){
       if(CI->isInlineAsm()){
-        llvm::InlineAsm *IA = llvm::dyn_cast<llvm::InlineAsm>(CI->getCalledValue());
+        llvm::InlineAsm *IA = llvm::dyn_cast<llvm::InlineAsm>(CS.getCalledOperand());
         assert(IA);
         *asmstr = IA->getAsmString();
         stripws(*asmstr);
@@ -1137,11 +1163,10 @@ bool POWERInterpreter::isInlineAsm(llvm::CallSite &CS, std::string *asmstr){
 bool POWERInterpreter::isInlineAsm(llvm::Instruction &I, std::string *asmstr){
   llvm::CallInst *C = llvm::dyn_cast<llvm::CallInst>(&I);
   if(!C) return false;
-  llvm::CallSite CS(C);
-  return isInlineAsm(CS,asmstr);
+  return isInlineAsm(AnyCallInst(C),asmstr);
 }
 
-void POWERInterpreter::visitInlineAsm(llvm::CallSite &CS, const std::string &asmstr){
+void POWERInterpreter::visitInlineAsm(llvm::CallInst &CI, const std::string &asmstr){
   if(asmstr == "DMB" || asmstr == "dmb" ||
      asmstr == "DSB" || asmstr == "dsb" ||
      asmstr == "ISB" || asmstr == "isb" ||
@@ -1155,11 +1180,11 @@ void POWERInterpreter::visitInlineAsm(llvm::CallSite &CS, const std::string &asm
   }
 }
 
-void POWERInterpreter::visitCallSite(llvm::CallSite CS) {
+void POWERInterpreter::visitAnyCallInst(AnyCallInst CI) {
   {
     std::string asmstr;
-    if(isInlineAsm(CS,&asmstr)){
-      visitInlineAsm(CS,asmstr);
+    if(isInlineAsm(CI,&asmstr)){
+      visitInlineAsm(llvm::cast<llvm::CallInst>(CI),asmstr);
       return;
     }
   }
@@ -1167,7 +1192,7 @@ void POWERInterpreter::visitCallSite(llvm::CallSite CS) {
   ExecutionContext &SF = Threads[CurrentThread].ECStack.back();
 
   // Check to see if this is an intrinsic function call...
-  llvm::Function *F = CS.getCalledFunction();
+  llvm::Function *F = CI.getCalledFunction();
   if (F && F->isDeclaration()){
     switch (F->getIntrinsicID()) {
     case llvm::Intrinsic::not_intrinsic:
@@ -1178,7 +1203,7 @@ void POWERInterpreter::visitCallSite(llvm::CallSite CS) {
         llvm::GenericValue ArgIndex;
         ArgIndex.UIntPairVal.first = ECStack.size() - 1;
         ArgIndex.UIntPairVal.second = 0;
-        SetValue(CS.getInstruction(), ArgIndex, SF);
+        SetValue(CI.getInstruction(), ArgIndex, SF);
       */
       return;
     }
@@ -1190,7 +1215,7 @@ void POWERInterpreter::visitCallSite(llvm::CallSite CS) {
     case llvm::Intrinsic::vacopy:   // va_copy: dest = src
       throw std::logic_error("POWERInterpreter: Varargs are not supported.");
       /*
-        SetValue(CS.getInstruction(), getOperandValue(*CS.arg_begin(), SF), SF);
+        SetValue(CI.getInstruction(), getOperandValue(*CI.arg_begin(), SF), SF);
       */
       return;
     default:
@@ -1199,15 +1224,44 @@ void POWERInterpreter::visitCallSite(llvm::CallSite CS) {
           /* Ignore this intrinsic function */
           return;
         }
+
+        /* Other processes with program counter inside the same basic
+         * block as this one may be invalidated when the intrinsic
+         * function is lowered. This goes not only for the program
+         * counter in the topmost stack frame, but for all program
+         * counters on the stack. For each such program counter, store
+         * it as an integer during rewriting and restore it
+         * afterwards.
+         */
+        std::map<ExecutionContext*,int> pcs;
+        for(unsigned i = 0; i < Threads.size(); ++i){ // Other thread
+          int smax = Threads[i].ECStack.size();
+          if(i == (unsigned)CurrentThread){
+            // Don't change the top-most stack-frame of the current thread.
+            --smax;
+          }
+          for(int j = 0; j < smax; ++j){ // Stack frame
+            ExecutionContext *EC = &Threads[i].ECStack[j];
+            if(EC->CurBB == SF.CurBB){ // Pointing into this basic block
+              int c = 0; // PC as offset from beginning of basic block
+              while(EC->CurInst != EC->CurBB->begin()){
+                --EC->CurInst;
+                ++c;
+              }
+              pcs[EC] = c;
+            }
+          }
+        }
+
         // If it is an unknown intrinsic function, use the intrinsic lowering
         // class to transform it into hopefully tasty LLVM code.
         //
-        llvm::BasicBlock::iterator me(CS.getInstruction());
-        llvm::BasicBlock *Parent = CS.getInstruction()->getParent();
+        llvm::BasicBlock::iterator me(&CI);
+        llvm::BasicBlock *Parent = (&CI)->getParent();
         bool atBegin(Parent->begin() == me);
         if (!atBegin)
           --me;
-        IL->LowerIntrinsicCall(llvm::cast<llvm::CallInst>(CS.getInstruction()));
+        IL->LowerIntrinsicCall(llvm::cast<llvm::CallInst>(&CI));
 
         // Restore the CurInst pointer to the first instruction newly inserted, if
         // any.
@@ -1217,20 +1271,30 @@ void POWERInterpreter::visitCallSite(llvm::CallSite CS) {
           SF.CurInst = me;
           ++SF.CurInst;
         }
+
+        /* Restore the program counters for other stack frames in the
+         * same basic block.
+         */
+        for(auto it : pcs){
+          ExecutionContext *EC = it.first;
+          int c = it.second;
+          EC->CurInst = EC->CurBB->begin();
+          while(c--) ++EC->CurInst;
+        }
         return;
       }
     }
   }
 
-  assert(CS.getInstruction());
-  assert(CS.getInstruction() == &CurInstr->I);
+  assert(!(CI == nullptr));
+  assert(&CI == &CurInstr->I);
 
   std::vector<llvm::Value*> ArgVals;
-  const unsigned NumArgs = CS.arg_size();
+  const unsigned NumArgs = CI.arg_size();
   ArgVals.reserve(NumArgs);
   for(unsigned i = 0; i < NumArgs; ++i){
-    assert(CS.getArgument(i) == CS.getInstruction()->getOperand(i));
-    ArgVals.push_back(CS.getInstruction()->getOperand(i));
+    assert(CI.arg_begin()[i] == (&CI)->getOperand(i));
+    ArgVals.push_back((&CI)->getOperand(i));
   }
 
   // To handle indirect calls, we must get the pointer value from the argument
@@ -1257,11 +1321,11 @@ int POWERInterpreter::getCalleeOpIdx(const llvm::Instruction &I){
 llvm::Function *POWERInterpreter::getCallee(){
 #ifndef NDEBUG
   if(llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(&CurInstr->I)){
-    assert(CI->getCalledValue() == CI->getOperand(CI->getNumOperands()-1));
+    assert(AnyCallInst(CI).getCalledOperand() == CI->getOperand(CI->getNumOperands()-1));
   }else{
     assert(llvm::dyn_cast<llvm::InvokeInst>(&CurInstr->I));
     llvm::InvokeInst &II = llvm::cast<llvm::InvokeInst>(CurInstr->I);
-    assert(II.getCalledValue() == II.getOperand(II.getNumOperands()-3));
+    assert(AnyCallInst(&II).getCalledOperand() == II.getOperand(II.getNumOperands()-3));
   }
 #endif
   return (llvm::Function*)GVTOP(getOperandValue(getCalleeOpIdx(CurInstr->I)));
@@ -1424,7 +1488,7 @@ llvm::GenericValue POWERInterpreter::executeFPTruncInst(llvm::Value *SrcVal,
                                                         llvm::Type *DstTy) {
   llvm::GenericValue Dest;
 
-  if (SrcVal->getType()->getTypeID() == llvm::Type::VectorTyID) {
+  if (llvm::isa<llvm::VectorType>(SrcVal->getType())) {
     assert(SrcVal->getType()->getScalarType()->isDoubleTy() &&
            DstTy->getScalarType()->isFloatTy() &&
            "Invalid FPTrunc instruction");
@@ -1448,7 +1512,7 @@ llvm::GenericValue POWERInterpreter::executeFPExtInst(llvm::Value *SrcVal,
                                                       llvm::Type *DstTy) {
   llvm::GenericValue Dest;
 
-  if (SrcVal->getType()->getTypeID() == llvm::Type::VectorTyID) {
+  if (llvm::isa<llvm::VectorType>(SrcVal->getType())) {
     assert(SrcVal->getType()->getScalarType()->isFloatTy() &&
            DstTy->getScalarType()->isDoubleTy() && "Invalid FPExt instruction");
 
@@ -1472,7 +1536,7 @@ llvm::GenericValue POWERInterpreter::executeFPToUIInst(llvm::Value *SrcVal,
   llvm::Type *SrcTy = SrcVal->getType();
   llvm::GenericValue Dest;
 
-  if (SrcTy->getTypeID() == llvm::Type::VectorTyID) {
+  if (llvm::isa<llvm::VectorType>(SrcTy)) {
     const llvm::Type *DstVecTy = DstTy->getScalarType();
     const llvm::Type *SrcVecTy = SrcTy->getScalarType();
     uint32_t DBitWidth = llvm::cast<llvm::IntegerType>(DstVecTy)->getBitWidth();
@@ -1511,7 +1575,7 @@ llvm::GenericValue POWERInterpreter::executeFPToSIInst(llvm::Value *SrcVal,
   llvm::Type *SrcTy = SrcVal->getType();
   llvm::GenericValue Dest;
 
-  if (SrcTy->getTypeID() == llvm::Type::VectorTyID) {
+  if (llvm::isa<llvm::VectorType>(SrcTy)) {
     const llvm::Type *DstVecTy = DstTy->getScalarType();
     const llvm::Type *SrcVecTy = SrcTy->getScalarType();
     uint32_t DBitWidth = llvm::cast<llvm::IntegerType>(DstVecTy)->getBitWidth();
@@ -1548,7 +1612,7 @@ llvm::GenericValue POWERInterpreter::executeUIToFPInst(llvm::Value *SrcVal,
                                                        llvm::Type *DstTy) {
   llvm::GenericValue Dest;
 
-  if (SrcVal->getType()->getTypeID() == llvm::Type::VectorTyID) {
+  if (llvm::isa<llvm::VectorType>(SrcVal->getType())) {
     const llvm::Type *DstVecTy = DstTy->getScalarType();
     unsigned size = Src.AggregateVal.size();
     // the sizes of src and dst vectors must be equal
@@ -1581,7 +1645,7 @@ llvm::GenericValue POWERInterpreter::executeSIToFPInst(llvm::Value *SrcVal,
                                                        llvm::Type *DstTy) {
   llvm::GenericValue Dest;
 
-  if (SrcVal->getType()->getTypeID() == llvm::Type::VectorTyID) {
+  if (llvm::isa<llvm::VectorType>(SrcVal->getType())) {
     const llvm::Type *DstVecTy = DstTy->getScalarType();
     unsigned size = Src.AggregateVal.size();
     // the sizes of src and dst vectors must be equal
@@ -1645,8 +1709,7 @@ llvm::GenericValue POWERInterpreter::executeBitCastInst(llvm::Value *SrcVal,
   llvm::Type *SrcTy = SrcVal->getType();
   llvm::GenericValue Dest;
 
-  if ((SrcTy->getTypeID() == llvm::Type::VectorTyID) ||
-      (DstTy->getTypeID() == llvm::Type::VectorTyID)) {
+  if (llvm::isa<llvm::VectorType>(SrcTy) || llvm::isa<llvm::VectorType>(DstTy)) {
     // vector src bitcast to vector dst or vector src bitcast to scalar dst or
     // scalar src bitcast to vector dst
     bool isLittleEndian = TD.isLittleEndian();
@@ -1658,7 +1721,7 @@ llvm::GenericValue POWERInterpreter::executeBitCastInst(llvm::Value *SrcVal,
     unsigned SrcNum;
     unsigned DstNum;
 
-    if (SrcTy->getTypeID() == llvm::Type::VectorTyID) {
+    if (llvm::isa<llvm::VectorType>(SrcTy)) {
       SrcElemTy = SrcTy->getScalarType();
       SrcBitSize = SrcTy->getScalarSizeInBits();
       SrcNum = Src.AggregateVal.size();
@@ -1671,7 +1734,7 @@ llvm::GenericValue POWERInterpreter::executeBitCastInst(llvm::Value *SrcVal,
       SrcVec.AggregateVal.push_back(Src);
     }
 
-    if (DstTy->getTypeID() == llvm::Type::VectorTyID) {
+    if (llvm::isa<llvm::VectorType>(DstTy)) {
       DstElemTy = DstTy->getScalarType();
       DstBitSize = DstTy->getScalarSizeInBits();
       DstNum = (SrcNum * SrcBitSize) / DstBitSize;
@@ -1744,7 +1807,7 @@ llvm::GenericValue POWERInterpreter::executeBitCastInst(llvm::Value *SrcVal,
     }
 
     // convert result from integer to specified type
-    if (DstTy->getTypeID() == llvm::Type::VectorTyID) {
+    if (llvm::isa<llvm::VectorType>(DstTy)) {
       if (DstElemTy->isDoubleTy()) {
         Dest.AggregateVal.resize(DstNum);
         for (unsigned i = 0; i < DstNum; i++)
@@ -1767,8 +1830,7 @@ llvm::GenericValue POWERInterpreter::executeBitCastInst(llvm::Value *SrcVal,
         Dest.IntVal = TempDst.AggregateVal[0].IntVal;
       }
     }
-  } else { //  if ((SrcTy->getTypeID() == llvm::Type::VectorTyID) ||
-           //     (DstTy->getTypeID() == llvm::Type::VectorTyID))
+  } else { //   if (isa<VectorType>(SrcTy) || isa<VectorType>(DstTy))
 
     // scalar src bitcast to scalar dst
     if (DstTy->isPointerTy()) {
@@ -2046,7 +2108,7 @@ void POWERInterpreter::visitExtractValueInst(llvm::ExtractValueInst &I) {
     break;
   case llvm::Type::ArrayTyID:
   case llvm::Type::StructTyID:
-  case llvm::Type::VectorTyID:
+  LLVM_VECTOR_TYPEID_CASES
     Dest.AggregateVal = pSrc->AggregateVal;
     break;
   case llvm::Type::PointerTyID:
@@ -2092,7 +2154,7 @@ void POWERInterpreter::visitInsertValueInst(llvm::InsertValueInst &I) {
     break;
   case llvm::Type::ArrayTyID:
   case llvm::Type::StructTyID:
-  case llvm::Type::VectorTyID:
+  LLVM_VECTOR_TYPEID_CASES
     pDest->AggregateVal = Src2.AggregateVal;
     break;
   case llvm::Type::PointerTyID:
@@ -2249,7 +2311,9 @@ llvm::GenericValue POWERInterpreter::getConstantValue(llvm::Constant *CPV){
 void POWERInterpreter::callAssume(llvm::Function *F){
   bool cond = getOperandValue(0).IntVal.getBoolValue();
   if(!cond){
+    setAssumeBlocked(true);
     Threads[CurrentThread].ECStack.clear();
+    Blocked = true;
     AtExitHandlers.clear();
     /* Do not call terminate. We don't want to explicitly terminate
      * since that would allow other processes to join with this
@@ -2261,6 +2325,7 @@ void POWERInterpreter::callAssume(llvm::Function *F){
 void POWERInterpreter::callAssertFail(llvm::Function *F){
   TB.assertion_error("(unspecified)");
   Threads[CurrentThread].ECStack.clear();
+  Blocked = true;
   AtExitHandlers.clear();
 
   /* Record error in error trace */
@@ -2288,10 +2353,16 @@ void POWERInterpreter::callAssertFail(llvm::Function *F){
    */
 }
 
-void POWERInterpreter::callMalloc(llvm::Function *F){
-  unsigned n = getOperandValue(0).IntVal.getZExtValue();
-
-  void *Memory = malloc(n);
+void POWERInterpreter::callMCalloc(llvm::Function *F,bool isCalloc){
+  void *Memory;
+  if(isCalloc){
+    unsigned nm = getOperandValue(0).IntVal.getZExtValue();
+    unsigned sz = getOperandValue(1).IntVal.getZExtValue();
+    Memory = calloc(nm,sz);
+  }else{
+    unsigned n = getOperandValue(0).IntVal.getZExtValue();
+    Memory = malloc(n);
+  }
 
   llvm::GenericValue Result = llvm::PTOGV(Memory);
   assert(Result.PointerVal && "Null pointer returned by malloc!");
@@ -2332,14 +2403,14 @@ void POWERInterpreter::callPthreadCreate(llvm::Function *F){
   llvm::Function *F_inner = (llvm::Function*)GVTOP(getOperandValue(2));
   std::vector<llvm::Value*> ArgVals_inner;
   llvm::Type *i8ptr = llvm::Type::getInt8PtrTy(F->getContext());
-  if(F_inner->getArgumentList().size() == 1 &&
+  if(F_inner->arg_size() == 1 &&
      F_inner->arg_begin()->getType() == i8ptr){
     void *opval = llvm::GVTOP(getOperandValue(3));
     llvm::Type *i64 = llvm::Type::getInt64Ty(F->getContext());
     llvm::Constant *opval_int = llvm::ConstantInt::get(i64,uint64_t(opval));
     llvm::Value *opval_ptr = llvm::ConstantExpr::getIntToPtr(opval_int,i8ptr);
     ArgVals_inner.push_back(opval_ptr);
-  }else if(F_inner->getArgumentList().size()){
+  }else if(F_inner->arg_size()){
     std::string _err;
     llvm::raw_string_ostream err(_err);
     err << "Unsupported: function passed as argument to pthread_create has type: "
@@ -2437,7 +2508,10 @@ void POWERInterpreter::callFunction(llvm::Function *F,
   }else if(F->getName().str() == "free"){
     return; // Do nothing
   }else if(F->getName().str() == "malloc"){
-    callMalloc(F);
+    callMCalloc(F,false);
+    return;
+  }else if(F->getName().str() == "calloc"){
+    callMCalloc(F,true);
     return;
   }else if(F->getName().str() == "pthread_create"){
     callPthreadCreate(F);
@@ -2477,7 +2551,7 @@ void POWERInterpreter::callFunction(llvm::Function *F,
   }
 
   if(conf.ee_store_trace){
-    TB.trace_register_function_entry(CurrentThread,F->getName(),0);
+    TB.trace_register_function_entry(CurrentThread,std::string(F->getName()),0);
   }
 
   // Get pointers to first LLVM BB & llvm::Instruction in function.
@@ -2504,6 +2578,7 @@ void POWERInterpreter::callFunction(llvm::Function *F,
 
 void POWERInterpreter::abort(){
   for(unsigned p = 0; p < Threads.size(); ++p){
+    if(!Threads[p].ECStack.empty()) Blocked = true;
     Threads[p].ECStack.clear();
     Threads[p].CommittableEvents.clear();
   }
@@ -2536,7 +2611,7 @@ void POWERInterpreter::registerOperand(int proc, FetchedInstruction &FI, int idx
     llvm::Function *F = getCallee(FI.I);
     if(F && F->getName() == "pthread_join"){
       assert(idx == 0);
-      int tid = FI.Operands[idx].Value.IntVal.getLimitedValue();
+      int tid = pthread_t_to_tid(F->arg_begin()->getType(), FI.Operands[idx].Value);
       TB.register_addr({proc,FI.EventIndex},0,MRef(Threads[tid].status,1));
       static POWERARMTraceBuilder::ldreqfun_t istwo =
         [](const MBlock &B){
@@ -2676,9 +2751,8 @@ std::shared_ptr<POWERInterpreter::FetchedInstruction> POWERInterpreter::fetch(ll
             store_count = 2;
             FI->Operands[0].IsAddrOf = 0;
             assert(I.getOperand(0)->getType()->isPointerTy());
-            assert(llvm::cast<llvm::PointerType>(I.getOperand(0)->getType())->getElementType()->isIntegerTy());
-            llvm::IntegerType *ty =
-              llvm::cast<llvm::IntegerType>(llvm::cast<llvm::PointerType>(I.getOperand(0)->getType())->getElementType());
+            llvm::Type *ty =
+              llvm::cast<llvm::PointerType>(I.getOperand(0)->getType())->getElementType();
 #ifdef LLVM_EXECUTIONENGINE_DATALAYOUT_PTR
             int pthread_t_sz = int(getDataLayout()->getTypeStoreSize(ty));
 #else
@@ -2688,8 +2762,7 @@ std::shared_ptr<POWERInterpreter::FetchedInstruction> POWERInterpreter::fetch(ll
             MBlock data(addr,pthread_t_sz);
             MBlock data1({0,1},1);
             *((uint8_t*)data1.get_block()) = 1;
-            llvm::GenericValue Val;
-            Val.IntVal = llvm::APInt(ty->getBitWidth(),Threads.size());
+            llvm::GenericValue Val = tid_to_pthread_t(ty, Threads.size());
             StoreValueToMemory(Val,(llvm::GenericValue*)data.get_block(),ty);
             extra_accesses.push_back(ExtraAccess(0,data));
             extra_accesses.push_back(ExtraAccess(1,data1));

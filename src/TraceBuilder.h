@@ -23,7 +23,6 @@
 #define __TRACE_BUILDER_H__
 
 #include "Configuration.h"
-#include "MRef.h"
 #include "Trace.h"
 
 #include <string>
@@ -45,6 +44,10 @@ public:
   virtual ~TraceBuilder();
   /* Returns true iff the sleepset is currently empty. */
   virtual bool sleepset_is_empty() const = 0;
+  /* When called at the end of an execution, returns true iff there are
+   * any await-statements that are blocking.
+   */
+  virtual bool await_blocked() const { return false; }
   /* Returns true iff this trace contains any happens-before cycle.
    *
    * If there is a happens-before cycle, and conf.check_robustness is
@@ -100,10 +103,22 @@ public:
    * rather than the current.
    */
   virtual void memory_error(std::string msg, const IID<CPid> &loc = IID<CPid>());
+  /* Notify the TraceBuilder that nondeterminism has been detected.
+   *
+   * If loc is given, the error is associated with that location
+   * rather than the current.
+   */
+  virtual void nondeterminism_error(std::string msg, const IID<CPid> &loc = IID<CPid>());
+  /* Notify the TraceBuilder that invalid behaviour has been detected.
+   *
+   * If loc is given, the error is associated with that location
+   * rather than the current.
+   */
+  virtual void invalid_input_error(std::string msg, const IID<CPid> &loc = IID<CPid>());
   /* Estimate the total number of traces for this program based on the
    * traces that have been seen.
    */
-  virtual int estimate_trace_count() const { return 1; };
+  virtual long double estimate_trace_count() const { return 1; };
 protected:
   const Configuration &conf;
   std::vector<Error*> errors;

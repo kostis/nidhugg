@@ -26,13 +26,18 @@
 #include "POWERARMTraceBuilder.h"
 #include "PSOInterpreter.h"
 #include "PSOTraceBuilder.h"
-#include "SigSegvHandler.h"
 #include "StrModule.h"
 #include "TSOInterpreter.h"
 #include "TSOTraceBuilder.h"
+#include "RFSCTraceBuilder.h"
+#include "RFSCUnfoldingTree.h"
+#include "Cpubind.h"
 
 #include <fstream>
 #include <stdexcept>
+#include <iomanip>
+#include <cfloat>
+#include <thread>
 
 #if defined(HAVE_LLVM_IR_LLVMCONTEXT_H)
 #include <llvm/IR/LLVMContext.h>
@@ -45,8 +50,42 @@
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/SourceMgr.h>
 
+namespace {
+  const char ESC_char = 27;
+
+  struct RunResult {
+    Trace *trace;
+    bool assume_blocked;
+    int tasks_created;
+  };
+
+  template<typename T = RunResult>
+  class BlockingQueue {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::queue<T> queue;
+
+  public:
+    T dequeue() {
+      std::unique_lock<std::mutex> lock(mtx);
+      while (queue.empty()) {
+        cv.wait(lock);
+      }
+      T res = std::forward<T>(queue.front());
+      queue.pop();
+      return res;
+    }
+
+    void enqueue(T res) {
+      std::lock_guard<std::mutex> lock(mtx);
+      queue.emplace(std::forward<T>(res));
+      cv.notify_one();
+    }
+  };
+}
+
 DPORDriver::DPORDriver(const Configuration &C) :
-  conf(C), mod(0) {
+  conf(C) {
   std::string ErrorMsg;
   llvm::sys::DynamicLibrary::LoadLibraryPermanently(0,&ErrorMsg);
 }
@@ -56,8 +95,6 @@ DPORDriver *DPORDriver::parseIRFile(const std::string &filename,
   DPORDriver *driver =
     new DPORDriver(C);
   read_file(filename,driver->src);
-  driver->reparse();
-  CheckModule::check_functions(driver->mod);
   return driver;
 }
 
@@ -66,13 +103,7 @@ DPORDriver *DPORDriver::parseIR(const std::string &llvm_asm,
   DPORDriver *driver =
     new DPORDriver(C);
   driver->src = llvm_asm;
-  driver->reparse();
-  CheckModule::check_functions(driver->mod);
   return driver;
-}
-
-DPORDriver::~DPORDriver(){
-  delete mod;
 }
 
 void DPORDriver::read_file(const std::string &filename, std::string &tgt){
@@ -87,9 +118,12 @@ void DPORDriver::read_file(const std::string &filename, std::string &tgt){
   is.close();
 }
 
-void DPORDriver::reparse(){
-  delete mod;
-  mod = StrModule::read_module_src(src);
+std::unique_ptr<llvm::Module> DPORDriver::
+parse(ParseOptions opts, llvm::LLVMContext &context){
+  std::unique_ptr<llvm::Module> mod(StrModule::read_module_src(src,context));
+  if (opts == PARSE_AND_CHECK) {
+    CheckModule::check_functions(mod.get());
+  }
   if(mod->LLVM_MODULE_GET_DATA_LAYOUT_STRING().empty()){
     if(llvm::sys::IsLittleEndianHost){
       mod->setDataLayout("e");
@@ -97,11 +131,14 @@ void DPORDriver::reparse(){
       mod->setDataLayout("E");
     }
   }
+  return mod;
 }
 
-llvm::ExecutionEngine *DPORDriver::create_execution_engine(TraceBuilder &TB, const Configuration &conf) const {
+std::unique_ptr<DPORInterpreter> DPORDriver::
+create_execution_engine(TraceBuilder &TB, llvm::Module *mod,
+                        const Configuration &conf) const {
   std::string ErrorMsg;
-  llvm::ExecutionEngine *EE = 0;
+  std::unique_ptr<DPORInterpreter> EE = 0;
   switch(conf.memory_model){
   case Configuration::SC:
     EE = llvm::Interpreter::create(mod,static_cast<TSOPSOTraceBuilder&>(TB),conf,&ErrorMsg);
@@ -148,11 +185,12 @@ llvm::ExecutionEngine *DPORDriver::create_execution_engine(TraceBuilder &TB, con
   return EE;
 }
 
-Trace *DPORDriver::run_once(TraceBuilder &TB) const{
-  std::shared_ptr<llvm::ExecutionEngine> EE(create_execution_engine(TB,conf));
+Trace *DPORDriver::run_once(TraceBuilder &TB, llvm::Module *mod,
+                            bool &assume_blocked) const{
+  std::unique_ptr<DPORInterpreter> EE(create_execution_engine(TB,mod,conf));
 
   // Run main.
-  EE->runFunctionAsMain(mod->getFunction("main"), {"prog"}, 0);
+  EE->runFunctionAsMain(mod->getFunction("main"), conf.argv, 0);
 
   // Run static destructors.
   EE->runStaticConstructorsDestructors(true);
@@ -160,6 +198,8 @@ Trace *DPORDriver::run_once(TraceBuilder &TB) const{
   if(conf.check_robustness){
     static_cast<llvm::Interpreter*>(EE.get())->checkForCycles();
   }
+
+  assume_blocked = EE->assumeBlocked();
 
   EE.reset();
 
@@ -171,14 +211,13 @@ Trace *DPORDriver::run_once(TraceBuilder &TB) const{
       static_cast<POWERARMTraceBuilder&>(TB).replay();
       Configuration conf2(conf);
       conf2.ee_store_trace = true;
-      llvm::ExecutionEngine *E = create_execution_engine(TB,conf2);
-      E->runFunctionAsMain(mod->getFunction("main"), {"prog"}, 0);
+      std::unique_ptr<DPORInterpreter> E = create_execution_engine(TB,mod,conf2);
+      E->runFunctionAsMain(mod->getFunction("main"), conf.argv, 0);
       E->runStaticConstructorsDestructors(true);
       if(conf.check_robustness){
-        static_cast<llvm::Interpreter*>(E)->checkForCycles();
+        static_cast<llvm::Interpreter*>(E.get())->checkForCycles();
       }
       t = TB.get_trace();
-      delete E;
     }else{
       t = TB.get_trace();
     }
@@ -187,14 +226,204 @@ Trace *DPORDriver::run_once(TraceBuilder &TB) const{
   return t;
 }
 
+void DPORDriver::print_progress(uint64_t computation_count, long double estimate, Result &res, int tasks_left) {
+  if(computation_count % 100 == 0){
+    llvm::dbgs() << ESC_char << "[K" // Erase the line
+                 << "Traces: " << res.trace_count;
+    if(res.sleepset_blocked_trace_count)
+      llvm::dbgs() << ", " << res.sleepset_blocked_trace_count << " ssb";
+    if(res.assume_blocked_trace_count)
+      llvm::dbgs() << ", " << res.assume_blocked_trace_count << " ab";
+    if(res.await_blocked_trace_count)
+      llvm::dbgs() << ", " << res.await_blocked_trace_count << " awb";
+    if(tasks_left != -1)
+      llvm::dbgs() << " (" << tasks_left << " jobs)";
+    if(conf.print_progress_estimate){
+      std::stringstream ss;
+      ss << std::setprecision(LDBL_DIG) << estimate;
+      llvm::dbgs() << " ("
+                   << int(100.0*(long double)(computation_count+1)/estimate)
+                   << "% of total estimate: "
+                   << ss.str() << ")";
+    }
+    llvm::dbgs() << "\r"; // Move cursor to start of line
+  }
+}
+
+bool DPORDriver::handle_trace(TraceBuilder *TB, Trace *t, uint64_t *computation_count, Result &res, bool assume_blocked) {
+  bool t_used = false;
+  if(t && conf.debug_collect_all_traces){
+    res.all_traces.push_back(t);
+    t_used = true;
+  }
+  if(!TB->sleepset_is_empty()) {
+    ++res.sleepset_blocked_trace_count;
+  }else if(assume_blocked){
+    ++res.assume_blocked_trace_count;
+  }else if(TB->await_blocked()){
+    ++res.await_blocked_trace_count;
+  }else{
+    ++res.trace_count;
+  }
+  ++*computation_count;
+  if(t && t->has_errors() && !res.has_errors()){
+    res.error_trace = t;
+    t_used = true;
+  }
+  bool has_errors = t && t->has_errors();
+  if(!t_used){
+    delete t;
+  }
+
+  return has_errors && !conf.explore_all_traces;
+}
+
+
+namespace{
+  std::unique_ptr<RFSCScheduler> make_scheduler(const Configuration &conf) {
+    switch (conf.exploration_scheduler) {
+    case Configuration::PRIOQUEUE:
+      return std::unique_ptr<RFSCScheduler>(new PriorityQueueScheduler());
+    case Configuration::WORKSTEALING:
+      return std::unique_ptr<RFSCScheduler>(new WorkstealingPQScheduler(conf.n_threads));
+    default:
+      abort();
+    }
+  }
+}
+
+DPORDriver::Result DPORDriver::run_rfsc_sequential() {
+  Result res;
+  std::unique_ptr<llvm::Module> mod = parse(PARSE_AND_CHECK);
+  RFSCDecisionTree decision_tree(make_scheduler(conf));
+  RFSCUnfoldingTree unfolding_tree;
+  RFSCTraceBuilder TB(decision_tree, unfolding_tree, conf);
+
+  uint64_t computation_count = 0;
+  long double estimate = 1;
+  int tasks_left = 1;
+
+  do{
+    if(conf.print_progress){
+      print_progress(computation_count, estimate, res);
+    }
+
+    bool assume_blocked = false;
+    TB.reset();
+    Trace *t= this->run_once(TB, mod.get(), assume_blocked);
+    TB.compute_prefixes();
+    tasks_left--;
+
+    int to_create = TB.tasks_created;
+
+
+    tasks_left += to_create;
+
+    if (handle_trace(&TB, t, &computation_count, res, assume_blocked)) {
+      break;
+    }
+    if(conf.print_progress_estimate && (computation_count+1) % 100 == 0){
+      estimate = std::round(TB.estimate_trace_count());
+    }
+    if((computation_count+1) % 1000 == 0){
+      /* llvm::ExecutionEngine leaks global variables until the Module is
+       * destructed */
+      mod = parse();
+    }
+
+  } while(tasks_left);
+
+  if(conf.print_progress){
+    llvm::dbgs() << ESC_char << "[K\n";
+  }
+
+  return res;
+}
+
+DPORDriver::Result DPORDriver::run_rfsc_parallel() {
+  Result res;
+  unsigned n_threads = conf.n_threads-1;
+  std::vector<std::thread> threads;
+  threads.reserve(n_threads);
+  Cpubind cpubind(conf.n_threads);
+
+  struct state {
+    state(const Configuration &conf) : decision_tree(make_scheduler(conf)) {}
+    RFSCDecisionTree decision_tree;
+    RFSCUnfoldingTree unfolding_tree;
+    uint64_t computation_count = 0;
+    std::mutex mutex;
+  } state(conf);
+
+  auto thread = [this, &res, &state] (unsigned id) {
+    auto context = std::make_unique<llvm::LLVMContext>();
+    std::unique_ptr<llvm::Module> mod = parse(id ? PARSE_ONLY : PARSE_AND_CHECK,
+                                              *context);
+    RFSCScheduler &sched = state.decision_tree.get_scheduler();
+    sched.register_thread(id);
+    RFSCTraceBuilder TB(state.decision_tree, state.unfolding_tree, conf);
+    unsigned int my_computation_count = 0;
+    while (TB.reset()) {
+      bool assume_blocked = false;
+      Trace *t = this->run_once(TB, mod.get(), assume_blocked);
+      TB.compute_prefixes();
+      TB.work_item.reset();
+
+      std::lock_guard<std::mutex> lock(state.mutex);
+      uint64_t remain =
+        sched.outstanding_jobs.fetch_sub(1, std::memory_order_relaxed)
+        - 1;
+      if (handle_trace(&TB, t, &state.computation_count, res, assume_blocked)
+          || remain == 0) {
+        sched.halt();
+      }
+      if(conf.print_progress){
+        const long double estimate = 1;
+        print_progress(state.computation_count, estimate, res, remain);
+      }
+      if (++my_computation_count % 1024 == 0) {
+        /* llvm::ExecutionEngine leaks global variables until the Module is
+         * destructed */
+        mod = parse(PARSE_ONLY, *context);
+      }
+    }
+  };
+
+  for (unsigned i = 0; i < n_threads; ++i) {
+    threads.emplace_back(thread, i+1);
+    cpubind.bind(threads.back(), i+1);
+  }
+  cpubind.bind(0);
+  thread(0);
+  for (unsigned i = 0; i < n_threads; ++i) {
+    threads[i].join();
+  }
+
+  if(conf.print_progress){
+    llvm::dbgs() << ESC_char << "[K\n";
+  }
+
+  return res;
+}
+
 DPORDriver::Result DPORDriver::run(){
   Result res;
+  std::unique_ptr<llvm::Module> mod = parse(PARSE_AND_CHECK);
 
-  TraceBuilder *TB = 0;
+  TraceBuilder *TB = nullptr;
 
   switch(conf.memory_model){
   case Configuration::SC:
-    TB = new TSOTraceBuilder(conf);
+    if(conf.dpor_algorithm != Configuration::READS_FROM){
+      TB = new TSOTraceBuilder(conf);
+    }else{
+      if (conf.n_threads == 1){
+        res = run_rfsc_sequential();
+      } else {
+        res = run_rfsc_parallel();
+      }
+      return res;
+    }
     break;
   case Configuration::TSO:
     TB = new TSOTraceBuilder(conf);
@@ -215,64 +444,33 @@ DPORDriver::Result DPORDriver::run(){
     throw std::logic_error("DPORDriver: Unsupported memory model.");
   }
 
-  SigSegvHandler::setup_signal_handler();
-
-  char esc = 27;
-  if(conf.print_progress){
-    llvm::dbgs() << esc << "[s"; // Save terminal cursor position
-  }
-
-  int computation_count = 0;
-  int estimate = 1;
+  uint64_t computation_count = 0;
+  long double estimate = 1;
   do{
-    if(conf.print_progress && (computation_count+1) % 100 == 0){
-      llvm::dbgs() << esc << "[u" // Restore cursor position
-                   << esc << "[s" // Save cursor position
-                   << esc << "[K" // Erase the line
-                   << "Computation #" << computation_count+1;
-      if(conf.print_progress_estimate){
-        llvm::dbgs() << " ("
-                     << int(100.0*float(computation_count+1)/float(estimate))
-                     << "% of total estimate: "
-                     << estimate << ")";
-      }
+    if(conf.print_progress){
+      print_progress(computation_count, estimate, res);
     }
     if((computation_count+1) % 1000 == 0){
-      reparse();
+      /* llvm::ExecutionEngine leaks global variables until the Module is
+       * destructed */
+      mod = parse();
     }
-    Trace *t = run_once(*TB);
-    bool t_used = false;
-    if(t && conf.debug_collect_all_traces){
-      res.all_traces.push_back(t);
-      t_used = true;
-    }
-    if(TB->sleepset_is_empty()){
-      ++res.trace_count;
-    }else{
-      ++res.sleepset_blocked_trace_count;
-    }
-    ++computation_count;
-    if(t && t->has_errors() && !res.has_errors()){
-      res.error_trace = t;
-      t_used = true;
-    }
-    bool has_errors = t && t->has_errors();
-    if(!t_used){
-      delete t;
-    }
-    if(has_errors && !conf.explore_all_traces) break;
+
+    bool assume_blocked = false;
+    Trace *t = run_once(*TB, mod.get(), assume_blocked);
+
+    if (handle_trace(TB, t, &computation_count, res, assume_blocked)) break;
     if(conf.print_progress_estimate && (computation_count+1) % 100 == 0){
-      estimate = TB->estimate_trace_count();
+      estimate = std::round(TB->estimate_trace_count());
     }
   }while(TB->reset());
 
   if(conf.print_progress){
-    llvm::dbgs() << "\n";
+    llvm::dbgs() << ESC_char << "[K\n";
   }
-
-  SigSegvHandler::reset_signal_handler();
 
   delete TB;
 
   return res;
 }
+

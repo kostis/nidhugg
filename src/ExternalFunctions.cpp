@@ -152,6 +152,7 @@ static ffi_type *ffiTypeFor(Type *Ty) {
         case 32: return &ffi_type_sint32;
         case 64: return &ffi_type_sint64;
       }
+      break;
     case Type::FloatTyID:   return &ffi_type_float;
     case Type::DoubleTyID:  return &ffi_type_double;
     case Type::PointerTyID: return &ffi_type_pointer;
@@ -188,6 +189,7 @@ static void *ffiValueFor(Type *Ty, const GenericValue &AV,
           return ArgDataPtr;
         }
       }
+      break;
     case Type::FloatTyID: {
       float *FloatPtr = (float *) ArgDataPtr;
       *FloatPtr = AV.FloatVal;
@@ -296,7 +298,7 @@ GenericValue Interpreter::callExternalFunction(Function *F,
   RawFunc RawFn;
   if (RF == RawFunctions->end()) {
     RawFn = (RawFunc)(intptr_t)
-      sys::DynamicLibrary::SearchForAddressOfSymbol(F->getName());
+      sys::DynamicLibrary::SearchForAddressOfSymbol(std::string(F->getName()));
     if (!RawFn)
       RawFn = (RawFunc)(intptr_t)getPointerToGlobalIfAvailable(F);
     if (RawFn != 0)

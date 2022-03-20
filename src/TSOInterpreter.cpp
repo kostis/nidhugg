@@ -39,9 +39,9 @@ TSOInterpreter::TSOInterpreter(llvm::Module *M, TSOTraceBuilder &TB,
 TSOInterpreter::~TSOInterpreter(){
 }
 
-llvm::ExecutionEngine *TSOInterpreter::create(llvm::Module *M, TSOTraceBuilder &TB,
-                                              const Configuration &conf,
-                                              std::string *ErrorStr){
+std::unique_ptr<TSOInterpreter> TSOInterpreter::
+create(llvm::Module *M, TSOTraceBuilder &TB, const Configuration &conf,
+       std::string *ErrorStr){
 #ifdef LLVM_MODULE_MATERIALIZE_ALL_PERMANENTLY_ERRORCODE_BOOL
   if(std::error_code EC = M->materializeAllPermanently()){
     // We got an error, just return 0
@@ -72,7 +72,7 @@ llvm::ExecutionEngine *TSOInterpreter::create(llvm::Module *M, TSOTraceBuilder &
   }
 #endif
 
-  return new TSOInterpreter(M,TB,conf);
+  return std::unique_ptr<TSOInterpreter>(new TSOInterpreter(M,TB,conf));
 }
 
 void TSOInterpreter::runAux(int proc, int aux){
@@ -81,15 +81,14 @@ void TSOInterpreter::runAux(int proc, int aux){
   assert(aux == 0);
   assert(tso_threads[proc].store_buffer.size());
 
-  const MBlock &blk = tso_threads[proc].store_buffer.front();
+  void *ref = tso_threads[proc].store_buffer.front().first;
+  const SymData &blk = tso_threads[proc].store_buffer.front().second;
 
-  TB.atomic_store(blk.get_ref());
+  if(!TB.atomic_store(blk)) { abort(); return; }
 
   if(DryRun) return;
 
-  if(!CheckedMemCpy((uint8_t*)blk.get_ref().ref,(uint8_t*)blk.get_block(),blk.get_ref().size)){
-    return;
-  };
+  std::memcpy((uint8_t*)ref,(uint8_t*)blk.get_block(),blk.get_ref().size);
 
   for(unsigned i = 0; i < tso_threads[proc].store_buffer.size()-1; ++i){
     tso_threads[proc].store_buffer[i] = tso_threads[proc].store_buffer[i+1];
@@ -123,9 +122,8 @@ int TSOInterpreter::newThread(const CPid &cpid){
 }
 
 bool TSOInterpreter::isFence(llvm::Instruction &I){
-  if(llvm::isa<llvm::CallInst>(I)){
-    llvm::CallSite CS(static_cast<llvm::CallInst*>(&I));
-    llvm::Function *F = CS.getCalledFunction();
+  if(llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(&I)){
+    llvm::Function *F = CI->getCalledFunction();
     if(F && F->isDeclaration() &&
        F->getIntrinsicID() == llvm::Intrinsic::not_intrinsic &&
        conf.extfun_no_fence.count(F->getName().str()) == 0){
@@ -134,7 +132,7 @@ bool TSOInterpreter::isFence(llvm::Instruction &I){
     if(F && F->getName().str().find("__VERIFIER_atomic_") == 0) return true;
     {
       std::string asmstr;
-      if(isInlineAsm(CS,&asmstr) && asmstr == "mfence") return true;
+      if(isInlineAsm(AnyCallInst(CI),&asmstr) && asmstr == "mfence") return true;
     }
   }else if(llvm::isa<llvm::StoreInst>(I)){
     return static_cast<llvm::StoreInst&>(I).getOrdering() == LLVM_ATOMIC_ORDERING_SCOPE::SequentiallyConsistent;
@@ -204,10 +202,11 @@ bool TSOInterpreter::checkRefuse(llvm::Instruction &I){
     llvm::ExecutionContext &SF = ECStack()->back();
     llvm::GenericValue SRC = getOperandValue(static_cast<llvm::LoadInst&>(I).getPointerOperand(), SF);
     llvm::GenericValue *Ptr = (llvm::GenericValue*)GVTOP(SRC);
-    MRef mr = GetMRef(Ptr,static_cast<llvm::LoadInst&>(I).getType());
+    Option<SymAddrSize> mr = TryGetSymAddrSize(Ptr,static_cast<llvm::LoadInst&>(I).getType());
+    if (!mr) return false; /* Let it execute and segfault */
     for(int i = int(tso_threads[CurrentThread].store_buffer.size())-1; 0 <= i; --i){
-      if(mr.overlaps(tso_threads[CurrentThread].store_buffer[i].get_ref())){
-        if(mr != tso_threads[CurrentThread].store_buffer[i].get_ref()){
+      if(mr->overlaps(tso_threads[CurrentThread].store_buffer[i].second.get_ref())){
+        if(*mr != tso_threads[CurrentThread].store_buffer[i].second.get_ref()){
           /* Block until this store buffer entry has disappeared from
            * the buffer.
            */
@@ -229,28 +228,30 @@ void TSOInterpreter::visitLoadInst(llvm::LoadInst &I){
   llvm::GenericValue *Ptr = (llvm::GenericValue*)GVTOP(SRC);
   llvm::GenericValue Result;
 
-  TB.load(GetMRef(Ptr,I.getType()));
+  Option<SymAddrSize> Ptr_sas = GetSymAddrSize(Ptr,I.getType());
+  if (!Ptr_sas) return;
+  if(!TB.load(*Ptr_sas)) { abort(); return; }
 
   if(DryRun && DryRunMem.size()){
     assert(tso_threads[CurrentThread].store_buffer.empty());
-    DryRunLoadValueFromMemory(Result, Ptr, I.getType());
+    DryRunLoadValueFromMemory(Result, Ptr, *Ptr_sas, I.getType());
     SetValue(&I, Result, SF);
     return;
   }
 
   /* Check store buffer for ROWE opportunity. */
   for(int i = int(tso_threads[CurrentThread].store_buffer.size())-1; 0 <= i; --i){
-    if(Ptr == tso_threads[CurrentThread].store_buffer[i].get_ref().ref){
+    if(Ptr_sas->addr == tso_threads[CurrentThread].store_buffer[i].second.get_ref().addr){
       /* Read-Own-Write-Early */
-      assert(GetMRef(Ptr,I.getType()).size == tso_threads[CurrentThread].store_buffer[i].get_ref().size);
-      CheckedLoadValueFromMemory(Result,(llvm::GenericValue*)tso_threads[CurrentThread].store_buffer[i].get_block(),I.getType());
+      assert(Ptr_sas->size == tso_threads[CurrentThread].store_buffer[i].second.get_ref().size);
+      LoadValueFromMemory(Result,(llvm::GenericValue*)tso_threads[CurrentThread].store_buffer[i].second.get_block(),I.getType());
       SetValue(&I, Result, SF);
       return;
     }
   }
 
   /* Load from memory */
-  if(!CheckedLoadValueFromMemory(Result, Ptr, I.getType())) return;
+  LoadValueFromMemory(Result, Ptr, I.getType());
   SetValue(&I, Result, SF);
 }
 
@@ -258,31 +259,33 @@ void TSOInterpreter::visitStoreInst(llvm::StoreInst &I){
   llvm::ExecutionContext &SF = ECStack()->back();
   llvm::GenericValue Val = getOperandValue(I.getOperand(0), SF);
   llvm::GenericValue *Ptr = (llvm::GenericValue *)GVTOP(getOperandValue(I.getPointerOperand(), SF));
+  Option<SymData> sd = GetSymData(Ptr, I.getOperand(0)->getType(), Val);
+  if (!sd) return;
 
   if(I.getOrdering() == LLVM_ATOMIC_ORDERING_SCOPE::SequentiallyConsistent ||
      0 <= AtomicFunctionCall){
     /* Atomic store */
     assert(tso_threads[CurrentThread].store_buffer.empty());
-    TB.atomic_store(GetMRef(Ptr,I.getOperand(0)->getType()));
+    if(!TB.atomic_store(*sd)) { abort(); return; }
     if(DryRun){
-      DryRunMem.push_back(GetMBlock(Ptr, I.getOperand(0)->getType(), Val));
+      DryRunMem.push_back(std::move(*sd));
       return;
     }
-    CheckedStoreValueToMemory(Val, Ptr, I.getOperand(0)->getType());
+    StoreValueToMemory(Val, Ptr, I.getOperand(0)->getType());
   }else{
     /* Store to buffer */
-    TB.store(GetMRef(Ptr,I.getOperand(0)->getType()));
+    if(!TB.store(*sd)) { abort(); return; }
     if(DryRun){
-      DryRunMem.push_back(GetMBlock(Ptr, I.getOperand(0)->getType(), Val));
+      DryRunMem.push_back(std::move(*sd));
       return;
     }
-    tso_threads[CurrentThread].store_buffer.push_back(GetMBlock(Ptr, I.getOperand(0)->getType(), Val));
+    tso_threads[CurrentThread].store_buffer.emplace_back(Ptr, std::move(*sd));
   }
 }
 
 void TSOInterpreter::visitFenceInst(llvm::FenceInst &I){
   if(I.getOrdering() == LLVM_ATOMIC_ORDERING_SCOPE::SequentiallyConsistent){
-    TB.fence();
+    if(!TB.fence()) { abort(); return; }
   }
 }
 
@@ -296,9 +299,9 @@ void TSOInterpreter::visitAtomicRMWInst(llvm::AtomicRMWInst &I){
   Interpreter::visitAtomicRMWInst(I);
 }
 
-void TSOInterpreter::visitInlineAsm(llvm::CallSite &CS, const std::string &asmstr){
+void TSOInterpreter::visitInlineAsm(llvm::CallInst &CS, const std::string &asmstr){
   if(asmstr == "mfence"){
-    TB.fence();
+    if(!TB.fence()) { abort(); return; }
   }else if(asmstr == ""){ // Do nothing
   }else{
     throw std::logic_error("Unsupported inline assembly: "+asmstr);

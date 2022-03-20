@@ -23,8 +23,8 @@ Nidhugg can be compiled and installed on UNIX-like systems.
 Requirements
 ============
 
-   1. A C++ compiler supporting C++11. For example g++ version 4.7 or
-      higher, or clang++ version 3.1 or higher. (For compiling the
+   1. A C++ compiler supporting C++14. For example g++ version 6 or
+      higher, or clang++ version 3.8 or higher. (For compiling the
       tool Nidhugg.)
 
    2. The C compiler clang. (For use by Nidhugg as a frontend for C
@@ -36,17 +36,21 @@ Requirements
 
    5. Python version 3.0 or higher.
 
-   6. The LLVM library and headers, version 3.3 or higher. If you are
+   6. The LLVM library and headers, version 3.8 or higher. If you are
       compiling the LLVM library from sources, see Compiling LLVM
       below.
 
    7. Foreign Function Interface (libffi) library and headers.
 
-   (8). Optional: Boost Unit Test Framework.
+   8. Boost Unit Test Framework, version 1.64 or higher.
 
-   (9). Optional: Valgrind
+   (9). pkg-config, for generating a fully-featured configure script,
+        capable of autodetecting the flags needed for libffi.
+        Optional, but recommended.
 
-   (10). Optional: For documentation: pdflatex
+   (10). Optional: Valgrind
+
+   (11). Optional: For documentation: pdflatex
          (with packages article, inputenc, amssymb)
 
 For Users of Debian-like Systems
@@ -57,10 +61,11 @@ For Users of Debian-like Systems
 
    Mandatory:
    clang, libc6, libc6-dev, libstdc++6, autoconf, automake, python3,
-   llvm, llvm-dev, libffi-dev
+   llvm, llvm-dev, libffi-dev, libboost-test-dev, libboost-system-dev,
+   pkg-config
 
    Optional:
-   libboost-test-dev, valgrind, texlive-latex-base, texlive-base
+   valgrind, texlive-latex-base, texlive-base
 
 Getting Nidhugg
 ===============
@@ -80,12 +85,12 @@ Basic Installation
    The following assumes that you are in a shell in the main directory
    of Nidhugg.
 
-   1. Use GNU Autotools to build the configure script:
+   1. Use GNU Autotools to generate the configure script:
 
       $ autoreconf --install
 
-   2. Build as usual. See Installation Options below for options about
-      e.g. installation location.
+   2. Build as usual. See Installation Options below for options about e.g.
+      installation location.
 
       $ ./configure
       $ make
@@ -125,12 +130,12 @@ Specifying Compiler
    When the configure script is invoked, it will by GNU autotools
    magic determine which C++ compiler will be used during
    compilation. In case e.g. your default compiler does not support
-   C++11, but you have the compiler g++-4.6 installed at a
+   C++14, but you have the compiler g++-6 installed at a
    non-standard location you may want to override this. In order to do
-   so, specify the path to g++-4.6 in CXX when invoking the
+   so, specify the path to g++-6 in CXX when invoking the
    './configure' command:
 
-   $ ./configure CXX='/path/to/g++-4.6'
+   $ ./configure CXX='/path/to/g++-6'
 
 Specifying LLVM Installation
 ----------------------------
@@ -158,11 +163,31 @@ Specifying LLVM Installation
 Compiling LLVM
 ==============
 
-   LLVM is recommended to be compiled with optimized build and with
-   libffi.
+   If you are a user of Nidhugg, we recommend you use a release build of
+   LLVM. You can also speed up the build by disabling all the backends.
 
    $ cd llvm-*.src
-   $ ./configure --prefix /your/llvm/install/path --enable-optimized --enable-libffi
+   $ mkdir build && cd build
+   $ cmake -DCMAKE_INSTALL_PREFIX=/your/llvm/install/path \
+           -DCMAKE_BUILD_TYPE=Release \
+           -DLLVM_TARGETS_TO_BUILD="" -DLLVM_LINK_LLVM_DYLIB=ON ..
+   $ make
+   $ make install
+
+Compiling LLVM for Debugging or Developing Nidhugg
+**************************************************
+
+   If you are developing Nidhugg or are troubleshooting a bug in
+   Nidhugg, we recommend you use a debug build of LLVM, as this will
+   allow you to build an assertions-enabled build of Nidhugg.
+
+   $ cd llvm-*.src
+   $ mkdir build && cd build
+   $ cmake -DCMAKE_INSTALL_PREFIX=/your/llvm/install/path \
+           -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+           -DLLVM_ENABLE_ASSERTIONS=ON \
+           -DLLVM_TARGETS_TO_BUILD="" -DLLVM_LINK_LLVM_DYLIB=ON \
+           -DLLVM_OPTIMIZED_TABLEGEN=ON ..
    $ make
    $ make install
 
@@ -197,5 +222,5 @@ LLVM License
 Contact / Bug Report
 ********************
 
-   Feedback, questions or bug reports should be directed to Carl
-   Leonardsson (carl.leonardsson@gmail.com).
+   Feedback, questions or bug reports should be reported as issues on
+   Github.

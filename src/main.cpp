@@ -23,6 +23,7 @@
 #include "DPORDriver.h"
 #include "GlobalContext.h"
 #include "Transform.h"
+#include "Timing.h"
 
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ManagedStatic.h>
@@ -31,13 +32,25 @@
 #include <set>
 #include <stdexcept>
 
-llvm::cl::opt<std::string>
-cl_transform("transform",llvm::cl::init(""),
-             llvm::cl::desc("Transform the input module and store it (as LLVM assembly) to OUTFILE."),
-             llvm::cl::NotHidden,llvm::cl::value_desc("OUTFILE"));
+extern llvm::cl::opt<std::string> cl_transform;
 
+llvm::cl::opt<std::string>
+cl_input_file(llvm::cl::desc("<input bitcode or assembly>"),
+              llvm::cl::Positional,
+              llvm::cl::init("-"));
+
+extern llvm::cl::list<std::string>
+cl_program_arguments;
+
+static Timing::Context global_timing_context("global");
+
+#ifdef LLVM_CL_VERSIONPRINTER_TAKES_RAW_OSTREAM
+void print_version(llvm::raw_ostream &out){
+#else
 void print_version(){
-  std::cout << PACKAGE_STRING
+  auto &out = std::cout;
+#endif
+  out << PACKAGE_STRING
             << " ("
 #ifdef GIT_COMMIT
             << GIT_COMMIT << ", "
@@ -62,7 +75,7 @@ int main(int argc, char *argv[]){
     /* Hide all options defined by the LLVM library, except the ones
      * approved by Configuration.
      */
-    std::set<std::string> visible_options =
+    std::set<std::string, std::less<void>> visible_options =
       {"version"};
     visible_options.insert(Configuration::commandline_opts().begin(),
                            Configuration::commandline_opts().end());
@@ -77,31 +90,45 @@ int main(int argc, char *argv[]){
       if(visible_options.count(it->getKey()) == 0){
         it->getValue()->setHiddenFlag(llvm::cl::Hidden);
       }
+      if (it->getKey() == "help-list") {
+        /* Hide --help-list-hidden from --help-list description; there
+         * be dragons ('s options that we are pulling in due to how we
+         * link)
+         *
+         * This also fixes the problem that the --help-link description
+         * used to wrap
+         */
+        it->second->setDescription("Display list of available options");
+      }
     }
   }
-  llvm::cl::opt<std::string>
-    input_file(llvm::cl::desc("<input bitcode or assembly>"),
-               llvm::cl::Positional,
-               llvm::cl::init("-"));
   llvm::cl::ParseCommandLineOptions(argc, argv);
 
   bool errors_detected = false;
   try{
+    Timing::Guard timing_guard(global_timing_context);
     Configuration conf;
     conf.assign_by_commandline();
     conf.check_commandline();
 
     if(cl_transform != ""){
-      Transform::transform(input_file,cl_transform,conf);
+      Transform::transform(cl_input_file,cl_transform,conf);
     }else{
       /* Use DPORDriver to explore the given module */
       DPORDriver *driver =
-        DPORDriver::parseIRFile(input_file,conf);
+        DPORDriver::parseIRFile(cl_input_file,conf);
 
       DPORDriver::Result res = driver->run();
-      std::cout << "Trace count: " << res.trace_count
-                << " (also " << res.sleepset_blocked_trace_count
-                << " sleepset blocked)" << std::endl;
+      std::cout << "Trace count: " << res.trace_count << std::endl;
+      if (res.await_blocked_trace_count > 0)
+        std::cout << "Await-blocked trace count: "
+                  << res.await_blocked_trace_count << std::endl;
+      if (res.assume_blocked_trace_count > 0)
+        std::cout << "Assume-blocked trace count: "
+                  << res.assume_blocked_trace_count << std::endl;
+      if (res.sleepset_blocked_trace_count > 0)
+        std::cout << "Sleepset-blocked trace count: "
+                  << res.sleepset_blocked_trace_count << std::endl;
       if(res.has_errors()){
         errors_detected = true;
         std::cout << "\n Error detected:\n"
@@ -125,6 +152,11 @@ int main(int argc, char *argv[]){
     llvm::llvm_shutdown();
     return 1;
   }
+
+#ifndef NO_TIMING
+  if (Timing::timing_enabled())
+    Timing::print_report();
+#endif
 
   return (errors_detected ? VERIFICATION_FAILURE : EXIT_OK);
 }

@@ -48,9 +48,9 @@
 
 /// Create a new interpreter object.
 ///
-llvm::ExecutionEngine *POWERInterpreter::create(llvm::Module *M, POWERARMTraceBuilder &TB,
-                                                const Configuration &conf,
-                                                std::string *ErrStr) {
+std::unique_ptr<POWERInterpreter> POWERInterpreter::
+create(llvm::Module *M, POWERARMTraceBuilder &TB, const Configuration &conf,
+       std::string *ErrStr) {
   // Tell this Module to materialize everything and release the GVMaterializer.
 #ifdef LLVM_MODULE_MATERIALIZE_ALL_PERMANENTLY_ERRORCODE_BOOL
   if(std::error_code EC = M->materializeAllPermanently()){
@@ -82,19 +82,14 @@ llvm::ExecutionEngine *POWERInterpreter::create(llvm::Module *M, POWERARMTraceBu
   }
 #endif
 
-  return new POWERInterpreter(M,TB,conf);
+  return std::unique_ptr<POWERInterpreter>(new POWERInterpreter(M,TB,conf));
 }
 
 //===----------------------------------------------------------------------===//
 // Interpreter ctor - Initialize stuff
 //
 POWERInterpreter::POWERInterpreter(llvm::Module *M, POWERARMTraceBuilder &TB, const Configuration &conf)
-#ifdef LLVM_EXECUTIONENGINE_MODULE_UNIQUE_PTR
-  : llvm::ExecutionEngine(std::unique_ptr<llvm::Module>(M)),
-#else
-  : llvm::ExecutionEngine(M),
-#endif
-    TD(M), conf(conf), TB(TB) {
+  : DPORInterpreter(M), TD(M), conf(conf), TB(TB) {
 
   Threads.emplace_back(CPid());
   CurrentThread = 0;
@@ -110,9 +105,12 @@ POWERInterpreter::POWERInterpreter(llvm::Module *M, POWERARMTraceBuilder &TB, co
 
   static llvm::Value *V0 = llvm::ConstantInt::get(llvm::Type::getInt32Ty(M->getContext()),0);
   static llvm::Value *P0_32 = llvm::ConstantPointerNull::get(llvm::Type::getInt32PtrTy(M->getContext()));
-  dummy_store = new llvm::StoreInst(V0,P0_32);
+  dummy_store = new llvm::StoreInst(V0,P0_32,/*IsVolatile=*/false,/*Align=*/{},
+                                    /*InsertBefore=*/(llvm::Instruction*)nullptr);
   static llvm::Value *P0_8 = llvm::ConstantPointerNull::get(llvm::Type::getInt8PtrTy(M->getContext()));
-  dummy_load8 = new llvm::LoadInst(P0_8);
+  static llvm::Type *I8 = llvm::Type::getInt8Ty(M->getContext());
+  dummy_load8 = new llvm::LoadInst(I8, P0_8,"",/*IsVolatile=*/false,/*Align=*/{},
+                                   /*InsertBefore=*/(llvm::Instruction*)nullptr);
 }
 
 POWERInterpreter::~POWERInterpreter() {
@@ -156,6 +154,8 @@ POWERInterpreter::runFunction(llvm::Function *F,
                               llvm::ArrayRef<llvm::GenericValue> ArgValues) {
 #endif
   assert (F && "Function *F was null at entry to run()");
+
+  if (Blocked) return llvm::GenericValue();
 
   // Try extra hard not to pass extra args to a function that isn't
   // expecting them.  C programmers frequently bend the rules and

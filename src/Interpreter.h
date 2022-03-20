@@ -39,8 +39,11 @@
 
 #include "Configuration.h"
 #include "CPid.h"
-#include "MRef.h"
+#include "SymAddr.h"
+#include "VClock.h"
+#include "Option.h"
 #include "TSOPSOTraceBuilder.h"
+#include "DPORInterpreter.h"
 
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
@@ -61,17 +64,15 @@
 #elif defined(HAVE_LLVM_SUPPORT_INSTVISITOR_H)
 #include <llvm/Support/InstVisitor.h>
 #endif
-#if defined(HAVE_LLVM_SUPPORT_CALLSITE_H)
-#include <llvm/Support/CallSite.h>
-#elif defined(HAVE_LLVM_IR_CALLSITE_H)
-#include <llvm/IR/CallSite.h>
-#endif
+#include "AnyCallInst.h"
 #include <llvm/Support/DataTypes.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <random>
 #include <stdexcept>
+
+#include <boost/container/flat_map.hpp>
 
 namespace llvm {
 
@@ -91,13 +92,13 @@ struct ExecutionContext {
   BasicBlock::iterator  CurInst;    // The next instruction to execute
   std::map<Value *, GenericValue> Values; // LLVM values used in this invocation
   std::vector<GenericValue>  VarArgs; // Values passed through an ellipsis
-  CallSite             Caller;     // Holds the call that called subframes.
-                                   // NULL if main func or debugger invoked fn
+  AnyCallInst           Caller;     // Holds the call that called subframes.
+                                    // NULL if main func or debugger invoked fn
 };
 
 // Interpreter - This class represents the entirety of the interpreter.
 //
-class Interpreter : public ExecutionEngine, public InstVisitor<Interpreter> {
+class Interpreter : public DPORInterpreter, public InstVisitor<Interpreter> {
 protected:
   GenericValue ExitValue;          // The return value of the called function
   DataLayout TD;
@@ -113,13 +114,17 @@ protected:
   /* A Thread object keeps track of each running thread. */
   class Thread{
   public:
-    Thread() : RandEng(42), pending_mutex_lock(0) {};
+    Thread() : AssumeBlocked(false), RandEng(42), pending_mutex_lock(0), pending_condvar_awake(0) {};
     /* The complex thread identifier of this thread. */
     CPid cpid;
     /* The runtime stack of executing code. The top of the stack is the
      * current function record.
      */
     std::vector<ExecutionContext> ECStack;
+    /* Whether the thread execution has been blocked due to failing an
+     * assume-statement
+     */
+    bool AssumeBlocked;
     /* Contains the IDs (index into Threads) of all other threads
      * which are awaiting the termination of this thread to perform a
      * join.
@@ -134,16 +139,15 @@ protected:
      * will be the same (per thread) in every execution.
      */
     std::minstd_rand RandEng;
-    /* If it is the case that the next instruction should lock a mutex
-     * lock (in particular this happens immediately after a
-     * pthread_cond_wait) then pending_mutex_lock is a pointer to that
-     * pthread mutex object. The next instruction will then act as a
-     * pthread_mutex_lock(pending_mutex_lock) in addition to its
-     * normal semantics.
+    /* If this thread was suspended by calling pthread_cond_wait(cnd, lck),
+     * then pendinc_condvar_awake == cnd and pending_mutex_lock == lck.
+     * The next instruction will then do a pthread_cond_awake(cnd, lck)
+     * (which reacquires lck) in addition to its normal semantics.
      *
-     * pending_mutex_lock == 0 otherwise.
+     * pending_mutex_lock == 0 and pending_condvar_awake == 0 otherwise.
      */
     void *pending_mutex_lock;
+    void *pending_condvar_awake;
     /* Thread local global values are stored here. */
     std::map<GlobalValue*,GenericValue> ThreadLocalValues;
   };
@@ -171,6 +175,8 @@ protected:
    * DryRun is assigned by the scheduling by TB.
    */
   bool DryRun;
+  /* True if execution has stopped due to blocking */
+  bool Blocked = false;
   /* Keeps temporary changes to memory which are performed during dry
    * runs. Instead of changing the actual memory, during dry runs all
    * memory stores collected in DryRunMem. This allows memory loads
@@ -178,10 +184,10 @@ protected:
    * atomic function call) to check for updates that would have been
    * visible if the event were executing for real.
    *
-   * DryRunMem holds MBlocks corresponding to every store that has
+   * DryRunMem holds SymDatas corresponding to every store that has
    * been performed during this dry run, in order from older to newer.
    */
-  std::vector<MBlock> DryRunMem;
+  std::vector<SymData> DryRunMem;
   /* AtomicFunctionCall usually holds a negative value. However, while
    * we are executing inside an atomic function (one with a name
    * starting with "__VERIFIER_atomic_"), AtomicFunctionCall will hold
@@ -216,12 +222,23 @@ protected:
    */
   std::map<void*,PthreadMutex> PthreadMutexes;
 
+  /* The threads that are blocking in an await statement */
+  boost::container::flat_map
+  <SymAddrSize, boost::container::flat_map<int, AwaitCond>> blocking_awaits;
+
   /* The runtime stack of executing code. The top of the stack is the
    * current function record.
    *
    * This is the stack of the currently executing thread.
    */
   std::vector<ExecutionContext> *ECStack() { return &Threads[CurrentThread].ECStack; };
+
+  struct SymMBlockSize {
+    SymMBlockSize(SymMBlock block, uint32_t size) :
+      block(std::move(block)), size(size) {}
+    SymMBlock block;
+    uint32_t size;
+  };
 
   /* Memory that has been allocated, and that should be freed at the
    * end of the execution.
@@ -232,6 +249,9 @@ protected:
    */
   std::set<void*> AllocatedMemHeap;
   std::set<void*> AllocatedMemStack;
+
+  std::map<void*,SymMBlockSize> AllocatedMem;
+  VClock<int> HeapAllocCount, StackAllocCount;
   /* Memory that has been explicitly freed by a call to free.
    *
    * The key is the freed memory. The value is the iid of the event
@@ -253,9 +273,10 @@ public:
 
   /// create - Create an interpreter ExecutionEngine. This can never fail.
   ///
-  static ExecutionEngine *create(Module *M, TSOPSOTraceBuilder &TB,
-                                 const Configuration &conf = Configuration::default_conf,
-                                 std::string *ErrorStr = 0);
+  static std::unique_ptr<Interpreter>
+  create(Module *M, TSOPSOTraceBuilder &TB,
+         const Configuration &conf = Configuration::default_conf,
+         std::string *ErrorStr = 0);
 
   /// run - Start execution with the specified function and arguments.
   ///
@@ -339,9 +360,12 @@ public:
   virtual void visitBitCastInst(BitCastInst &I);
   virtual void visitSelectInst(SelectInst &I);
 
-  virtual void visitCallSite(CallSite CS);
-  virtual void visitCallInst(CallInst &I) { visitCallSite (CallSite (&I)); }
-  virtual void visitInvokeInst(InvokeInst &I) { visitCallSite (CallSite (&I)); }
+  virtual void visitAnyCallInst(AnyCallInst CI);
+#ifdef LLVM_HAS_CALLBASE
+  virtual void visitCallBase(CallBase &CB) { visitAnyCallInst(&CB); }
+#else
+  virtual void visitCallSite(CallSite CS) { visitAnyCallInst(CS); }
+#endif
   virtual void visitUnreachableInst(UnreachableInst &I);
 
   virtual void visitShl(BinaryOperator &I);
@@ -359,7 +383,7 @@ public:
   virtual void visitFenceInst(FenceInst &I) { /* Do nothing */ };
   virtual void visitAtomicCmpXchgInst(AtomicCmpXchgInst &I);
   virtual void visitAtomicRMWInst(AtomicRMWInst &I);
-  virtual void visitInlineAsm(CallSite &CS, const std::string &asmstr);
+  virtual void visitInlineAsm(llvm::CallInst &CI, const std::string &asmstr);
 
   virtual void visitInstruction(Instruction &I) {
     errs() << I << "\n";
@@ -371,6 +395,7 @@ public:
   virtual void exitCalled(GenericValue GV);
 
   virtual void addAtExitHandler(Function *F) {
+    assert(F && "Caller must validate F");
     AtExitHandlers.push_back(F);
   }
 
@@ -455,37 +480,70 @@ protected:  // Helper functions
   /* Empty all stacks. */
   virtual void clearAllStacks();
 
-  /* Get an MRef for the pointer Ptr, with the size given by Ty for
-   * the current data layout.
+  /* Get a SymAddr for the pointer Ptr, returning false if the address
+   * is unknown.
+   * GetSymAddr() additionally reports the error and calls abort()
+   * before returning nullptr.
    */
-  MRef GetMRef(void *Ptr, Type *Ty){
+  Option<SymAddr> TryGetSymAddr(void *Ptr);
+  Option<SymAddr> GetSymAddr(void *Ptr);
+  /* Get a SymAddrSize for the pointer Ptr, with the size given by Ty
+   * for the current data layout.
+   * GetSymAddrSize() reports the error and calls abort() before returning
+   * nullptr.
+   */
+  Option<SymAddrSize> GetSymAddrSize(void *Ptr, Type *Ty) {
+    if (Option<SymAddr> addr = GetSymAddr(Ptr)) {
 #ifdef LLVM_EXECUTIONENGINE_DATALAYOUT_PTR
-    return {Ptr,int(getDataLayout()->getTypeStoreSize(Ty))};
+      return {{*addr,getDataLayout()->getTypeStoreSize(Ty)}};
 #else
-    return {Ptr,int(getDataLayout().getTypeStoreSize(Ty))};
+      return {{*addr,getDataLayout().getTypeStoreSize(Ty)}};
 #endif
-  };
-  ConstMRef GetConstMRef(void const *Ptr, Type *Ty){
+    } else {
+      return nullptr;
+    }
+  }
+
+  Option<SymAddrSize> TryGetSymAddrSize(void *Ptr, Type *Ty){
+    if (Option<SymAddr> addr = TryGetSymAddr(Ptr)) {
 #ifdef LLVM_EXECUTIONENGINE_DATALAYOUT_PTR
-    return {Ptr,int(getDataLayout()->getTypeStoreSize(Ty))};
+      return {{*addr,getDataLayout()->getTypeStoreSize(Ty)}};
 #else
-    return {Ptr,int(getDataLayout().getTypeStoreSize(Ty))};
+      return {{*addr,getDataLayout().getTypeStoreSize(Ty)}};
 #endif
-  };
-  /* Get an MBlock associated with the location Ptr, and holding the
+    } else {
+      return nullptr;
+    }
+  }
+  /* Get a SymData associated with the location Ptr, and holding the
    * value Val of type Ty. The size of the memory location will be
    * that of Ty.
    */
-  MBlock GetMBlock(void *Ptr, Type *Ty, const GenericValue &Val){
+  Option<SymData> GetSymData(void *Ptr, Type *Ty, const GenericValue &Val){
+    Option<SymAddrSize> Ptr_sas = GetSymAddrSize(Ptr,Ty);
+    if (!Ptr_sas) return nullptr;
+    return GetSymData(*Ptr_sas, Ty, Val);
+  }
+  /* Get a SymData associated with the location Ptr, and holding the
+   * value Val of type Ty. The size of the memory location will be
+   * that of Ty.
+   */
+  SymData GetSymData(SymAddrSize Ptr, Type *Ty, const GenericValue &Val){
 #ifdef LLVM_EXECUTIONENGINE_DATALAYOUT_PTR
     uint64_t alloc_size = getDataLayout()->getTypeAllocSize(Ty);
 #else
     uint64_t alloc_size = getDataLayout().getTypeAllocSize(Ty);
 #endif
-    MBlock B(GetMRef(Ptr,Ty),alloc_size);
+    SymData B(Ptr,alloc_size);
     StoreValueToMemory(Val,static_cast<GenericValue*>(B.get_block()),Ty);
     return B;
   };
+
+  /* Checks whether F refers to a valid function, returns true if so, or
+   * false if not. If invalid also reports the error in TB and calls
+   * abort().
+   */
+  bool ValidateFunctionPointer(Function *F);
 
   /* Same as ExecutionEngine::LoadValueFromMemory, but if any of the
    * bytes that should be loaded occur in a memory block in DryRunMem,
@@ -493,30 +551,11 @@ protected:  // Helper functions
    * bytes in memory.
    */
   virtual void DryRunLoadValueFromMemory(GenericValue &Val,
-                                         GenericValue *Src, Type *Ty);
+                                         GenericValue *Src,
+                                         SymAddrSize Src_sas, Type *Ty);
 
-  /* Same as ExecutionEngine::StoreValueToMemory, but check for
-   * segmentation faults, and generate errors as appropriate.
-   *
-   * Returns true on success, false on failure (segmentation fault).
-   */
-  virtual bool CheckedStoreValueToMemory(const GenericValue &Val,
-                                         GenericValue *Ptr, Type *Ty);
-  /* Same as ExecutionEngine::LoadValueFromMemory, but check for
-   * segmentation faults, and generate errors as appropriate.
-   *
-   * Returns true on success, false on failure (segmentation fault).
-   */
-  virtual bool CheckedLoadValueFromMemory(GenericValue &Val,
-                                          GenericValue *Src, Type *Ty);
-  virtual bool CheckedLoadIntFromMemory(APInt &IntVal, uint8_t *Src, unsigned LoadBytes);
-  virtual bool CheckedStoreIntToMemory(const APInt &IntVal, uint8_t *Dst, unsigned StoreBytes);
-  template<typename T> bool CheckedAssign(T &tgt, const T *src);
-  template<typename T> bool CheckedStore(T *tgt, const T &src);
-  virtual bool CheckedMemCpy(uint8_t *dst, const uint8_t *src, unsigned n);
-  virtual bool CheckedMemSet(uint8_t *s, int c, size_t n);
   /* Returns true if I is a call to an unknown intrinsic function, as
-   * defined by Interpreter::visitCallSite. Such function calls are
+   * defined by Interpreter::visitAnyCallInst. Such function calls are
    * replaced by some other sequence of instructions upon execution.
    */
   virtual bool isUnknownIntrinsic(Instruction &I);
@@ -532,12 +571,22 @@ protected:  // Helper functions
    * stored to *ptr.
    */
   virtual bool isPthreadMutexLock(Instruction &I, GenericValue **ptr);
+  /* Returns true iff I is a call to __VERIFIER_load_await_*.
+   *
+   * The address is stored to *ptr, and the condition is stored to *cond.
+   */
+  virtual bool isLoadAwait(Instruction &I, GenericValue **ptr, AwaitCond *cond);
+  /* Returns true iff I is a call to __VERIFIER_xchg_await_*.
+   *
+   * The address is stored to *ptr, and the condition is stored to *cond.
+   */
+  virtual bool isXchgAwait(Instruction &I, GenericValue **ptr, AwaitCond *cond);
   /* Returns true iff CS is a call to inline assembly.
    *
    * If CS is a call to inline assembly, then *asmstr is assigned the
    * assembly string.
    */
-  virtual bool isInlineAsm(CallSite &CS, std::string *asmstr);
+  virtual bool isInlineAsm(AnyCallInst CI, std::string *asmstr);
   /* I should be the next instruction that has been
    * scheduled. CurrentProc and ECStack shoauld be properly setup to
    * execute I.
@@ -573,13 +622,21 @@ protected:  // Helper functions
   virtual void callPthreadCondSignal(Function *F, const std::vector<GenericValue> &ArgVals);
   virtual void callPthreadCondBroadcast(Function *F, const std::vector<GenericValue> &ArgVals);
   virtual void callPthreadCondWait(Function *F, const std::vector<GenericValue> &ArgVals);
+  virtual void doPthreadCondAwake(void *cnd, void *lck);
   virtual void callPthreadCondDestroy(Function *F, const std::vector<GenericValue> &ArgVals);
   virtual void callNondetInt(Function *F, const std::vector<GenericValue> &ArgVals);
   virtual void callAssume(Function *F, const std::vector<GenericValue> &ArgVals);
-  virtual void callMalloc(Function *F, const std::vector<GenericValue> &ArgVals);
+  virtual void callMCalloc(Function *F, const std::vector<GenericValue> &ArgVals, bool isCalloc);
   virtual void callFree(Function *F, const std::vector<GenericValue> &ArgVals);
   virtual void callAssertFail(Function *F, const std::vector<GenericValue> &ArgVals);
   virtual void callAtexit(Function *F, const std::vector<GenericValue> &ArgVals);
+  virtual void callLoadAwait(Function *F, const std::vector<GenericValue> &ArgVals);
+  virtual void callXchgAwait(Function *F, const std::vector<GenericValue> &ArgVals);
+
+private:
+  void CheckAwaitWakeup(const GenericValue &Val, const void *ptr, const SymAddrSize &sas);
+  bool isAnyAwait(Instruction &I, GenericValue **ptr, AwaitCond *cond,
+                  const char *name_prefix, unsigned nargs);
 };
 
 } // End llvm namespace

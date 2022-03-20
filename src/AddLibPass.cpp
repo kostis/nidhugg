@@ -68,6 +68,8 @@ bool AddLibPass::optAddFunction(llvm::Module &M,
   for(auto it = srces.begin(); !added_def && it != srces.end(); ++it){
     std::string src = StrModule::portasm(*it);
     llvm::Module *M2 = StrModule::read_module_src(src);
+    /* Not really true, but silences linker warnings */
+    M2->setDataLayout(M.getDataLayout());
 
     if(!tgtTy || M2->getFunction(name)->getType() == tgtTy){
 #ifdef LLVM_LINKER_LINKINMODULE_PTR_BOOL
@@ -153,7 +155,7 @@ bool AddLibPass::runOnModule(llvm::Module &M){
       /* Figure out types for arguments of calloc (declaration) and
        * malloc.
        */
-      if(F->getArgumentList().size() != 2){
+      if(F->arg_size() != 2){
         throw std::logic_error("Unable to add definition of calloc. Wrong signature.");
       }
       std::string arg0ty, arg1ty, malloc_argty, malloc_declaration;
@@ -167,7 +169,7 @@ bool AddLibPass::runOnModule(llvm::Module &M){
       arg1tys.flush();
       llvm::Function *F_malloc = M.getFunction("malloc");
       if(F_malloc){
-        if(F_malloc->getArgumentList().size() != 1){
+        if(F_malloc->arg_size() != 1){
           throw std::logic_error("Unable to add definition of calloc. malloc has the wrong signature.");
         }
         malloc_argtys << *F_malloc->arg_begin()->getType();

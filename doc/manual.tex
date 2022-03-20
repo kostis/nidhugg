@@ -55,6 +55,11 @@ A test case must satisfy the following two conditions
 %
   This means that the test case may not e.g.\ check the time, or
   perform file I/O.
+%
+  If this condition is not satisfied, Nidhugg \emph{may} be able to
+  detect the nondeterminism and report it as an error with an attached
+  error trace (currently only supported under SC/TSO/PSO). However,
+  there is no guarantee for this, and a crash is a likely outcome.
 \end{description}
 
 \section{Supported Memory Models}
@@ -183,7 +188,8 @@ be analyzed by Nidhugg using a command like the following:
 
 \vspace{5pt}
 \noindent
-\texttt{\$ nidhugg $FLAGS$ \{--sc,--tso,--pso,--power,--arm\} $FILE$.ll}
+\texttt{\$ nidhugg $FLAGS$ \{--sc,--tso,--pso,--power,--arm\} $FILE$.ll $\backslash$}\\
+\texttt{\rule{20pt}{0pt}$[$ -- $PROGRAM\;ARGUMENTS$ $]$}
 
 \vspace{5pt}\noindent
 %
@@ -266,7 +272,31 @@ int main(int argc, char *argv[]){
 %
   Analyze the test case under the SC, TSO, PSO, POWER or ARM memory
   model respectively.
-\item{\texttt{--robustness}}
+\item{\texttt{--source/--optimal/--observers/--rf}}
+%
+  Use the Source DPOR, Optimal-DPOR, Optimal-DPOR with Observers, or Optimal
+  Reads-From-centric SMC algorithm for analysis, respectively.
+  %
+  Optimal DPOR guarantees no redundant (sleep set blocked) executions, at the
+  cost of some runtime overhead and a larger worst-case memory complexity.
+%
+  Observers additionally uses the observers optimisation; not considering two
+  memory writes to the same address to be racing unless the result is read.
+%
+  Reads-from-centric SMC semantically strengthens Observers, in the sense that
+  it always needs at most as many traces as Observers. However, RF-SMC is a
+  significantly different algorithm. Rather than focusing on the ordering of
+  racing, or otherwise dependent, operations, RF-SMC only concerns itself with
+  which read operations read which write operations. Due to optimality of such
+  an approach requiring solving NP-hard decision problems, in general, RF-SMC
+  relies on a heuristic for performance. If the heuristic fails, it falls back
+  to a slower decision procedure and performance might suffer, but we have not
+  been able to observe this happening in practice.
+%
+  \textbf{Optimal-DPOR, Optimal-DPOR with Observers, and Optimal
+    Reads-From-centric SMC algorithms are supported only for the SC memory
+    model.}
+\item{\texttt{--check-robustness}}
 %
   Perform a robustness analysis. In addition to considering the usual
   safety criteria, also check robustness, and report an error if a
@@ -286,10 +316,11 @@ int main(int argc, char *argv[]){
   assume that the call succeeds, allocate memory and provide the
   resulting memory pointer as return value for the call. But, if
   \texttt{--malloc-may-fail} is given to Nidhugg, then the case when
-  \texttt{malloc} fails and returns NULL is also analyzed.
+  \texttt{malloc} (or \texttt{calloc}) fails and returns NULL is also
+  analyzed.
 %
   \limitsupport{SC, TSO, PSO}
-\item{\texttt{--disable-mutex-init-requirement}}
+\item{\texttt{--no-check-mutex-init}}
 %
   If this switch is given, the operations lock, trylock, unlock,
   destroy, cond\_wait are allowed to operate on mutex variables
@@ -309,6 +340,8 @@ int main(int argc, char *argv[]){
 \item{\texttt{--version}}
 %
   Print the Nidhugg version and exit.
+\item{$PROGRAM\;ARGUMENTS$}, if given, will be sent as arguments
+  (argv) to the test case.
 \end{description}
 
 \subsubsection{Transformation Switches}\label{sec:transform:switches}
@@ -364,14 +397,15 @@ can be used as follows:
 \vspace{5pt}
 \noindent
 \texttt{\$ nidhuggc $CFLAGS$ -- \{--sc,--tso,--pso,--power,--arm\} $\backslash$}\\
-\rule{20pt}{0pt}\texttt{$AFLAGS$ $TFLAGS$ $FILE$.c}
+\rule{20pt}{0pt}\texttt{$AFLAGS$ $TFLAGS$ $FILE$.c $[$ -- $PROGRAM\;ARGUMENTS$ $]$}
 
 \vspace{5pt}\noindent
 %
 Here $CFLAGS$ are switches that will be given to the C compiler,
 $TFLAGS$ are Nidhugg transformation switches, and $AFLAGS$ are Nidhugg
-analysis switches. One common way to use \textsf{nidhuggc} is this
-call:
+analysis switches. Furthermore, $PROGRAM\;ARGUMENTS$, if given, will
+be sent as arguments to the program under test. One common way to use
+\textsf{nidhuggc} is this call:
 
 \vspace{5pt}
 \noindent
@@ -632,6 +666,7 @@ called as blackboxes. See Section~\ref{sec:external:functions}.
 
 \begin{description}
 \item{\texttt{malloc}}
+\item{\texttt{calloc}}
 \item{\texttt{free}}
 \item{\texttt{atexit}} (\limitsupport{SC, TSO, PSO})
 \item{\texttt{\_\_assert\_fail}} (Called by the \texttt{assert} macro
@@ -806,6 +841,9 @@ before use, making sure to use the same signatures as described here.
   return the same value in all executions that are explored.
 %
   \limitsupport{SC, TSO, PSO}
+
+  The value returned by \texttt{\_\_VERIFIER\_nondet\_int} can be
+  forced by specifying \texttt{--verifier-nondet-int=$value$}.
 \item{\texttt{unsigned int \_\_VERIFIER\_nondet\_uint()}}
 %
   Same as \texttt{\_\_VERIFIER\_nondet\_int}.
@@ -817,6 +855,12 @@ before use, making sure to use the same signatures as described here.
   \texttt{\_\_VERIFIER\_atomic\_} will execute atomically. This also
   means that it will execute under sequential consistency, and act as
   a full memory fence.
+
+  \textbf{Atomic functions may not contain control flow when using
+    Optimal-DPOR (\texttt{--optimal}), and additionally not writes to
+    multiple memory locations when using Observers
+    (\texttt{--observers}), or the analysis may not be sound.} %
+  Prefer using built-in atomic functions provided by the compiler.
 %
   \limitsupport{SC, TSO, PSO}
 \end{description}
@@ -856,3 +900,7 @@ increase (\texttt{\_\_atomic\_add\_fetch}).
 \end{thebibliography}
 
 \end{document}
+
+% Local Variables:
+% fill-column: 70
+% End:
