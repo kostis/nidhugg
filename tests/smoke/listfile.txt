@@ -45,6 +45,9 @@ sigma_false_3.c
 sigma_false_4.c
 parker_2.c
 
+storebuffer_assert.c
+storebuffer_fence.c
+
 #
 cmpxhg_test_3.c
 

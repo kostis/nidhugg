@@ -36,6 +36,8 @@ opt_lock_3 Forbid : 31
 sigma_false_3 Forbid : 12
 sigma_false_4 Forbid : 64
 parker_2 Forbid : 97
+storebuffer_assert Forbid : 3
+storebuffer_fence Forbid : 3
 cmpxhg_test_3 Forbid : 5
 mutex_deadlock_2 Forbid : 2
 mutex_deadlock_3 Forbid : 3
