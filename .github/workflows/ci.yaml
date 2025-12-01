@@ -8,6 +8,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - llvm: 20
+            ubuntu: 22
+          - llvm: 19
+            ubuntu: 22
           - llvm: 18
             ubuntu: 22
           - llvm: 17
